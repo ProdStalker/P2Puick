@@ -13,6 +13,8 @@ pub struct InnerState {
     pub role: Option<Role>,
     pub listen_port: u16,
     pub peer_addr: Option<String>,
+    /// Candidate host:port targets to try when joining (mDNS can return several IPs).
+    pub peer_addrs: Vec<String>,
     pub source_paths: Vec<PathBuf>,
     pub dest_dir: Option<PathBuf>,
     pub advertisement: Option<Advertisement>,
@@ -33,6 +35,7 @@ impl Default for InnerState {
             role: None,
             listen_port: p2puick_discovery::DEFAULT_PORT,
             peer_addr: None,
+            peer_addrs: Vec::new(),
             source_paths: Vec::new(),
             dest_dir: None,
             advertisement: None,

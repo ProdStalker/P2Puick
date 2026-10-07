@@ -94,6 +94,7 @@ pub async fn start_host(
         inner.source_paths.clear();
         inner.dest_dir = None;
         inner.peer_addr = None;
+        inner.peer_addrs.clear();
 
         let instance = format!("p2puick-{}", &code);
         let ad = Advertisement::start(&instance, port, &code).map_err(|e| e.to_string())?;
@@ -153,32 +154,46 @@ pub async fn join_session(
     port: Option<u16>,
 ) -> Result<String, String> {
     let port = port.unwrap_or(p2puick_discovery::DEFAULT_PORT);
-    let addr = if let Some(host) = host.filter(|h| !h.trim().is_empty()) {
-        p2puick_discovery::format_addr(host.trim(), port)
+    let addrs = if let Some(host) = host.filter(|h| !h.trim().is_empty()) {
+        vec![p2puick_discovery::format_addr(host.trim(), port)]
     } else {
-        let peers = p2puick_discovery::browse(Duration::from_secs(3), Some(pairing_code.clone()))
+        let peers = p2puick_discovery::browse(Duration::from_secs(4), Some(pairing_code.clone()))
             .await
             .map_err(|e| e.to_string())?;
         let peer = peers.into_iter().next().ok_or_else(|| {
-            "Aucun hôte trouvé sur le réseau local. Saisis l’IP manuellement.".to_string()
+            "Aucun hôte trouvé sur le réseau local. Saisis l’IP affichée côté hôte manuellement."
+                .to_string()
         })?;
-        p2puick_discovery::format_addr(&peer.host, peer.port)
+        let mut list: Vec<String> = peer
+            .addresses
+            .iter()
+            .map(|ip| p2puick_discovery::format_addr(ip, peer.port))
+            .collect();
+        if list.is_empty() {
+            list.push(p2puick_discovery::format_addr(&peer.host, peer.port));
+        }
+        list
     };
+    let primary = addrs
+        .first()
+        .cloned()
+        .ok_or_else(|| "Aucune adresse hôte".to_string())?;
 
     {
         let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
         inner.pairing_code = Some(pairing_code.clone());
         inner.role = Some(Role::Joiner);
-        inner.peer_addr = Some(addr.clone());
+        inner.peer_addr = Some(primary.clone());
+        inner.peer_addrs = addrs;
         inner.listen_port = port;
         inner.advertisement = None;
     }
 
     let _ = app.emit(
         "session-status",
-        serde_json::json!({ "status": "joined", "pairingCode": pairing_code, "addr": addr }),
+        serde_json::json!({ "status": "joined", "pairingCode": pairing_code, "addr": primary }),
     );
-    Ok(addr)
+    Ok(primary)
 }
 
 #[tauri::command]
@@ -274,22 +289,7 @@ pub async fn begin_send(
 
     match result {
         Ok(()) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = app.emit(
-                "transfer-progress",
-                ProgressEvent {
-                    kind: p2puick_core::ProgressKind::Error,
-                    relative_path: String::new(),
-                    bytes_done: 0,
-                    bytes_total: 0,
-                    files_done: 0,
-                    files_total: 0,
-                    message: msg.clone(),
-                },
-            );
-            Err(msg)
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -299,7 +299,7 @@ pub async fn begin_receive(
     state: State<'_, AppState>,
     dest_dir: String,
 ) -> Result<(), String> {
-    let (code, addr, session) = {
+    let (code, addrs, session) = {
         let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
         if inner.role != Some(Role::Joiner) {
             return Err("Rejoins d’abord une session".into());
@@ -308,14 +308,19 @@ pub async fn begin_receive(
             .pairing_code
             .clone()
             .ok_or_else(|| "Code de pairing manquant".to_string())?;
-        let addr = inner
-            .peer_addr
-            .clone()
-            .ok_or_else(|| "Adresse peer manquante".to_string())?;
+        let mut addrs = inner.peer_addrs.clone();
+        if addrs.is_empty() {
+            if let Some(addr) = inner.peer_addr.clone() {
+                addrs.push(addr);
+            }
+        }
+        if addrs.is_empty() {
+            return Err("Adresse peer manquante".into());
+        }
         inner.dest_dir = Some(PathBuf::from(&dest_dir));
         let session = TransferSession::new();
         inner.transfer = Some(session.clone());
-        (code, addr, session)
+        (code, addrs, session)
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
@@ -327,8 +332,8 @@ pub async fn begin_receive(
     });
 
     let result = session
-        .join_and_receive(
-            &addr,
+        .join_and_receive_addrs(
+            &addrs,
             SessionConfig {
                 pairing_code: code,
                 hostname: local_hostname(),
@@ -341,24 +346,10 @@ pub async fn begin_receive(
         )
         .await;
 
+    // Error progress is already emitted by the transfer engine when applicable.
     match result {
         Ok(()) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = app.emit(
-                "transfer-progress",
-                ProgressEvent {
-                    kind: p2puick_core::ProgressKind::Error,
-                    relative_path: String::new(),
-                    bytes_done: 0,
-                    bytes_total: 0,
-                    files_done: 0,
-                    files_total: 0,
-                    message: msg.clone(),
-                },
-            );
-            Err(msg)
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -472,22 +463,7 @@ pub async fn begin_send_retry(app: AppHandle, state: State<'_, AppState>) -> Res
 
     match result {
         Ok(()) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = app.emit(
-                "transfer-progress",
-                ProgressEvent {
-                    kind: p2puick_core::ProgressKind::Error,
-                    relative_path: String::new(),
-                    bytes_done: 0,
-                    bytes_total: 0,
-                    files_done: 0,
-                    files_total: 0,
-                    message: msg.clone(),
-                },
-            );
-            Err(msg)
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 

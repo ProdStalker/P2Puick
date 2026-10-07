@@ -312,12 +312,70 @@ impl TransferSession {
         dest_dir: PathBuf,
         progress: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
-        let stream = TcpStream::connect(addr).await.map_err(Error::from_io)?;
+        self.join_and_receive_addrs(&[addr.to_string()], config, dest_dir, progress)
+            .await
+    }
+
+    /// Try several `host:port` candidates (mDNS often exposes multiple IPv4s).
+    pub async fn join_and_receive_addrs(
+        &self,
+        addrs: &[String],
+        config: SessionConfig,
+        dest_dir: PathBuf,
+        progress: mpsc::UnboundedSender<ProgressEvent>,
+    ) -> Result<()> {
+        if addrs.is_empty() {
+            return Err(Error::Other("Aucune adresse hôte à joindre.".into()));
+        }
+
+        let mut last_err: Option<Error> = None;
+        let mut stream = None;
+        let mut used_addr = addrs[0].clone();
+        for addr in addrs {
+            let _ = progress.send(ProgressEvent {
+                kind: ProgressKind::Connected,
+                relative_path: String::new(),
+                bytes_done: 0,
+                bytes_total: 0,
+                files_done: 0,
+                files_total: 0,
+                message: format!("Connexion vers {addr}…"),
+            });
+            match TcpStream::connect(addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    used_addr = addr.clone();
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(Error::from_io(e));
+                }
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                let err = last_err.unwrap_or_else(|| {
+                    Error::Other("Impossible de joindre l’hôte (aucune adresse).".into())
+                });
+                let _ = progress.send(ProgressEvent {
+                    kind: ProgressKind::Error,
+                    relative_path: String::new(),
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    files_done: 0,
+                    files_total: 0,
+                    message: err.to_string(),
+                });
+                return Err(err);
+            }
+        };
+
         tune_tcp(&stream);
         let peer_label = stream
             .peer_addr()
             .map(|a| a.ip().to_string())
-            .unwrap_or_else(|_| addr.to_string());
+            .unwrap_or(used_addr);
         let _ = progress.send(ProgressEvent {
             kind: ProgressKind::Connected,
             relative_path: String::new(),

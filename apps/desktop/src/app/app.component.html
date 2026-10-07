@@ -55,7 +55,24 @@
 
       <div class="list" *ngIf="selectedPaths().length">
         <div class="list-item" *ngFor="let path of selectedPaths()">{{ path }}</div>
+        <button type="button" class="ghost list-clear" (click)="clearSources()">
+          Vider la sélection
+        </button>
       </div>
+
+      <label class="field">
+        <span>Dossiers exclus (un nom par ligne)</span>
+        <textarea
+          [(ngModel)]="excludeText"
+          rows="6"
+          spellcheck="false"
+          placeholder="node_modules&#10;vendor&#10;var"
+        ></textarea>
+      </label>
+      <p class="hint">
+        Ces dossiers (ex. <code>node_modules</code>, <code>vendor</code>, <code>var</code>) sont ignorés
+        pendant l’indexation — tu peux en ajouter ou en retirer.
+      </p>
 
       <div class="cta-row">
         <button type="button" class="secondary" (click)="pickSources()">Fichiers…</button>
@@ -109,8 +126,11 @@
       <div class="progress">
         <div class="bar" [style.width.%]="progressPercent()"></div>
       </div>
-      <p class="mono">{{ progressPercent() }}% — {{ progress()?.message || "…" }}</p>
-      <p class="hint" *ngIf="progress() as p">
+      <p class="mono progress-msg" [title]="progress()?.message || ''">
+        <span class="progress-pct">{{ progressPercent() }}%</span>
+        <span class="progress-detail">{{ progress()?.message || "…" }}</span>
+      </p>
+      <p class="hint progress-meta" *ngIf="progress() as p">
         Fichiers {{ p.filesDone }}/{{ p.filesTotal }} ·
         {{ p.bytesDone }}/{{ p.bytesTotal }} octets
       </p>

@@ -1,5 +1,8 @@
 use crate::state::{AppState, Role};
-use p2puick_core::{generate_pairing_code, ProgressEvent, SessionConfig, TransferSession};
+use p2puick_core::{
+    default_exclude_dir_names, generate_pairing_code, ProgressEvent, SessionConfig,
+    TransferSession,
+};
 use p2puick_discovery::{self, Advertisement, DiscoveredPeer};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -46,6 +49,11 @@ pub fn app_info() -> AppInfo {
 #[tauri::command]
 pub fn generate_code() -> String {
     generate_pairing_code()
+}
+
+#[tauri::command]
+pub fn default_excludes() -> Vec<String> {
+    default_exclude_dir_names()
 }
 
 #[tauri::command]
@@ -190,10 +198,13 @@ pub async fn begin_send(
     app: AppHandle,
     state: State<'_, AppState>,
     paths: Vec<String>,
+    exclude_dir_names: Option<Vec<String>>,
 ) -> Result<(), String> {
     if paths.is_empty() {
         return Err("Aucun fichier sélectionné".into());
     }
+
+    let excludes = exclude_dir_names.unwrap_or_else(default_exclude_dir_names);
 
     let (code, port, session) = {
         let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
@@ -231,6 +242,7 @@ pub async fn begin_send(
                 pairing_code: code,
                 hostname: local_hostname(),
                 concurrency: p2puick_core::DEFAULT_CONCURRENCY,
+                exclude_dir_names: excludes,
             },
             source_paths,
             tx,
@@ -302,6 +314,7 @@ pub async fn begin_receive(
                 pairing_code: code,
                 hostname: local_hostname(),
                 concurrency: p2puick_core::DEFAULT_CONCURRENCY,
+                exclude_dir_names: vec![],
             },
             PathBuf::from(dest_dir),
             tx,

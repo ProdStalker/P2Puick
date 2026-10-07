@@ -25,6 +25,7 @@ pub fn run() {
             commands::pick_folder,
             commands::app_info,
             commands::lan_info,
+            commands::default_excludes,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

@@ -43,6 +43,8 @@ export class AppComponent implements OnInit, OnDestroy {
   manualHost = "";
   manualPort = 47821;
   selectedPaths = signal<string[]>([]);
+  /** One directory name per line — skipped while walking trees. */
+  excludeText = "";
   destDir = signal("");
   peerAddr = signal("");
   progress = signal<ProgressEvent | null>(null);
@@ -55,6 +57,12 @@ export class AppComponent implements OnInit, OnDestroy {
 
   async ngOnInit(): Promise<void> {
     this.version.set(await loadAppVersion());
+    try {
+      const excludes = await invoke<string[]>("default_excludes");
+      this.excludeText = (excludes ?? []).join("\n");
+    } catch {
+      this.excludeText = "node_modules\nvendor\nvar\n.git\ntarget\ndist";
+    }
     void checkOnStartup();
     this.unlistenProgress = await listen<ProgressEvent>("transfer-progress", (event) => {
       this.progress.set(event.payload);
@@ -158,11 +166,16 @@ export class AppComponent implements OnInit, OnDestroy {
         title: "Choisir un dossier à envoyer",
       });
       if (folder) {
-        this.selectedPaths.set([...this.selectedPaths(), folder]);
+        // Replace selection (don't accumulate folders).
+        this.selectedPaths.set([folder]);
       }
     } catch (e) {
       this.error.set(String(e));
     }
+  }
+
+  clearSources(): void {
+    this.selectedPaths.set([]);
   }
 
   async pickDest(): Promise<void> {
@@ -187,8 +200,15 @@ export class AppComponent implements OnInit, OnDestroy {
     this.busy.set(true);
     this.mode.set("transfer");
     this.status.set("En attente du pair… Lance le transfert côté hôte puis rejoins depuis l’autre PC.");
+    const excludeDirNames = this.excludeText
+      .split(/[\n,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     try {
-      await invoke("begin_send", { paths: this.selectedPaths() });
+      await invoke("begin_send", {
+        paths: this.selectedPaths(),
+        excludeDirNames,
+      });
       this.status.set("Transfert terminé");
     } catch (e) {
       this.error.set(String(e));

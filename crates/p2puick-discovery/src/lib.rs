@@ -98,15 +98,16 @@ fn browse_blocking(
                         continue;
                     }
                 }
-                let addresses: Vec<String> = info
+                let mut addresses: Vec<String> = info
                     .get_addresses()
                     .iter()
                     .filter_map(|ip| match ip {
-                        IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
-                        IpAddr::V6(_) => None,
+                        IpAddr::V4(v4) if is_usable_lan_v4(*v4) => Some(v4.to_string()),
                         _ => None,
                     })
                     .collect();
+                // Prefer private LAN over leftover link-local if both somehow appear.
+                addresses.sort_by_key(|a| lan_addr_preference(a));
                 if addresses.is_empty() {
                     continue;
                 }
@@ -154,7 +155,25 @@ pub fn format_addr(host: &str, port: u16) -> String {
     }
 }
 
-/// Non-loopback IPv4 addresses on local interfaces (for manual pairing).
+fn is_usable_lan_v4(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_link_local()
+}
+
+/// Lower is better: private LAN first, then other global-ish, link-local last.
+fn lan_addr_preference(addr: &str) -> u8 {
+    let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() else {
+        return 90;
+    };
+    if ip.is_private() {
+        0
+    } else if ip.is_link_local() {
+        80
+    } else {
+        40
+    }
+}
+
+/// Non-loopback, non-link-local IPv4 addresses on local interfaces (for manual pairing).
 pub fn list_lan_ipv4() -> Vec<String> {
     let Ok(ifaces) = if_addrs::get_if_addrs() else {
         return Vec::new();
@@ -162,11 +181,11 @@ pub fn list_lan_ipv4() -> Vec<String> {
     let mut addrs: Vec<String> = ifaces
         .into_iter()
         .filter_map(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4.ip.to_string()),
+            if_addrs::IfAddr::V4(v4) if is_usable_lan_v4(v4.ip) => Some(v4.ip.to_string()),
             _ => None,
         })
         .collect();
-    addrs.sort();
+    addrs.sort_by_key(|a| (lan_addr_preference(a), a.clone()));
     addrs.dedup();
     addrs
 }

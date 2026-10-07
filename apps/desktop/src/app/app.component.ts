@@ -76,19 +76,30 @@ export class AppComponent implements OnInit, OnDestroy {
     await this.refreshRetryQueue();
     void checkOnStartup();
     this.unlistenProgress = await listen<ProgressEvent>("transfer-progress", (event) => {
-      this.progress.set(event.payload);
-      this.status.set(event.payload.message || event.payload.kind);
-      if (event.payload.kind === "complete") {
-        this.busy.set(false);
-        void this.refreshRetryQueue();
-      }
-      if (event.payload.kind === "fileFailed") {
-        void this.refreshRetryQueue();
-      }
-      if (event.payload.kind === "error" || event.payload.kind === "cancelled") {
-        this.busy.set(false);
-        this.error.set(event.payload.message);
-        void this.refreshRetryQueue();
+      const ev = event.payload;
+      this.progress.set(ev);
+      // High-level status only — live detail stays in the transfer panel (no duplicates).
+      switch (ev.kind) {
+        case "complete":
+          this.status.set("Transfert terminé");
+          this.busy.set(false);
+          void this.refreshRetryQueue();
+          break;
+        case "cancelled":
+          this.status.set("Annulé");
+          this.busy.set(false);
+          break;
+        case "error":
+          this.status.set("Échec du transfert");
+          this.busy.set(false);
+          this.error.set(ev.message);
+          void this.refreshRetryQueue();
+          break;
+        case "fileFailed":
+          void this.refreshRetryQueue();
+          break;
+        default:
+          break;
       }
     });
     this.unlistenStatus = await listen<Record<string, unknown>>("session-status", (event) => {
@@ -98,9 +109,6 @@ export class AppComponent implements OnInit, OnDestroy {
       }
       if (typeof payload["addr"] === "string") {
         this.peerAddr.set(payload["addr"]);
-      }
-      if (typeof payload["status"] === "string") {
-        this.status.set(String(payload["status"]));
       }
     });
   }
@@ -242,9 +250,10 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
     this.error.set("");
+    this.progress.set(null);
     this.busy.set(true);
     this.mode.set("transfer");
-    this.status.set("En attente du pair… Lance le transfert côté hôte puis rejoins depuis l’autre PC.");
+    this.status.set("En attente du pair…");
     const excludeDirNames = this.excludeText
       .split(/[\n,]+/)
       .map((s) => s.trim())
@@ -254,9 +263,15 @@ export class AppComponent implements OnInit, OnDestroy {
         paths: this.selectedPaths(),
         excludeDirNames,
       });
-      this.status.set("Transfert terminé");
+      if (!this.error()) {
+        this.status.set("Transfert terminé");
+      }
     } catch (e) {
-      this.error.set(String(e));
+      const msg = String(e);
+      if (!this.error()) {
+        this.error.set(msg);
+      }
+      this.status.set("Échec du transfert");
     } finally {
       this.busy.set(false);
       await this.refreshRetryQueue();
@@ -269,14 +284,21 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
     this.error.set("");
+    this.progress.set(null);
     this.busy.set(true);
     this.mode.set("transfer");
-    this.status.set("Renvoi des fichiers en échec — l’autre PC doit rejoindre la session.");
+    this.status.set("Renvoi des échecs — l’autre PC doit rejoindre…");
     try {
       await invoke("begin_send_retry");
-      this.status.set("Renvoi terminé");
+      if (!this.error()) {
+        this.status.set("Renvoi terminé");
+      }
     } catch (e) {
-      this.error.set(String(e));
+      const msg = String(e);
+      if (!this.error()) {
+        this.error.set(msg);
+      }
+      this.status.set("Échec du renvoi");
     } finally {
       this.busy.set(false);
       await this.refreshRetryQueue();
@@ -293,8 +315,10 @@ export class AppComponent implements OnInit, OnDestroy {
       this.error.set("Choisis un dossier de destination.");
       return;
     }
+    this.progress.set(null);
     this.busy.set(true);
     this.mode.set("transfer");
+    this.status.set("Connexion à l’hôte…");
     try {
       const addr = await invoke<string>("join_session", {
         pairingCode: this.joinCode.trim(),
@@ -302,11 +326,17 @@ export class AppComponent implements OnInit, OnDestroy {
         port: this.manualPort || null,
       });
       this.peerAddr.set(addr);
-      this.status.set(`Connecté à ${addr}`);
+      this.status.set(`Réception depuis ${addr}`);
       await invoke("begin_receive", { destDir: this.destDir() });
-      this.status.set("Réception terminée");
+      if (!this.error()) {
+        this.status.set("Réception terminée");
+      }
     } catch (e) {
-      this.error.set(String(e));
+      const msg = String(e);
+      if (!this.error()) {
+        this.error.set(msg);
+      }
+      this.status.set("Échec de la connexion");
     } finally {
       this.busy.set(false);
     }

@@ -15,7 +15,7 @@
   </header>
 
   <main>
-    <p class="status-line">{{ status() }}</p>
+    <p class="status-line" *ngIf="mode() !== 'transfer'">{{ status() }}</p>
     <p class="error" *ngIf="error()">{{ error() }}</p>
 
     <section *ngIf="mode() === 'home'" class="hero panel">
@@ -136,9 +136,13 @@
         <input [(ngModel)]="joinCode" maxlength="6" placeholder="123456" />
       </label>
       <label class="field">
-        <span>IP de l’hôte (recommandé si la découverte échoue)</span>
+        <span>IP de l’hôte (recommandé — celle affichée côté hôte)</span>
         <input [(ngModel)]="manualHost" placeholder="192.168.1.20" />
       </label>
+      <p class="hint">
+        L’hôte doit déjà avoir cliqué « Attendre le pair &amp; envoyer ». Utilise l’IP LAN privée
+        (192.168.x / 10.x), pas une adresse 169.254.x.
+      </p>
       <label class="field">
         <span>Port</span>
         <input type="number" [(ngModel)]="manualPort" />
@@ -160,6 +164,7 @@
 
     <section *ngIf="mode() === 'transfer'" class="panel">
       <h2>Transfert</h2>
+      <p class="hint">{{ status() }}</p>
       <div class="progress">
         <div class="bar" [style.width.%]="progressPercent()"></div>
       </div>

@@ -61,9 +61,13 @@ export class AppComponent implements OnInit, OnDestroy {
   changelog = signal<ChangelogEntry[]>([]);
   retryQueue = signal<FailedEntry[]>([]);
   retryQueuePath = signal("");
+  /** Instantaneous transfer speed in bytes/sec (UI). */
+  speedBps = signal(0);
 
   /** Screen to restore when leaving Historique (must not kill an active transfer). */
   private historyReturnMode: Mode = "home";
+  private speedLastBytes = 0;
+  private speedLastAt = 0;
 
   private unlistenProgress?: UnlistenFn;
   private unlistenStatus?: UnlistenFn;
@@ -81,20 +85,24 @@ export class AppComponent implements OnInit, OnDestroy {
     this.unlistenProgress = await listen<ProgressEvent>("transfer-progress", (event) => {
       const ev = event.payload;
       this.progress.set(ev);
+      this.updateSpeed(ev.bytesDone);
       // High-level status only — live detail stays in the transfer panel (no duplicates).
       switch (ev.kind) {
         case "complete":
           this.status.set("Transfert terminé");
           this.busy.set(false);
+          this.speedBps.set(0);
           void this.refreshRetryQueue();
           break;
         case "cancelled":
           this.status.set("Annulé");
           this.busy.set(false);
+          this.speedBps.set(0);
           break;
         case "error":
           this.status.set("Échec du transfert");
           this.busy.set(false);
+          this.speedBps.set(0);
           this.error.set(ev.message);
           void this.refreshRetryQueue();
           break;
@@ -260,6 +268,7 @@ export class AppComponent implements OnInit, OnDestroy {
     }
     this.error.set("");
     this.progress.set(null);
+    this.resetSpeed();
     this.busy.set(true);
     this.mode.set("transfer");
     this.status.set("En attente du pair…");
@@ -294,6 +303,7 @@ export class AppComponent implements OnInit, OnDestroy {
     }
     this.error.set("");
     this.progress.set(null);
+    this.resetSpeed();
     this.busy.set(true);
     this.mode.set("transfer");
     this.status.set("Renvoi des échecs — l’autre PC doit rejoindre…");
@@ -325,6 +335,7 @@ export class AppComponent implements OnInit, OnDestroy {
       return;
     }
     this.progress.set(null);
+    this.resetSpeed();
     this.busy.set(true);
     this.mode.set("transfer");
     this.status.set("Connexion à l’hôte…");
@@ -396,5 +407,41 @@ export class AppComponent implements OnInit, OnDestroy {
     const p = this.progress();
     if (!p || !p.bytesTotal) return 0;
     return Math.min(100, Math.round((p.bytesDone / p.bytesTotal) * 100));
+  }
+
+  formatBytes(n: number | null | undefined): string {
+    const v = Math.max(0, Number(n) || 0);
+    if (v < 1024) return `${Math.round(v)} o`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} Ko`;
+    if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} Mo`;
+    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} Go`;
+  }
+
+  formatSpeed(bps: number): string {
+    if (!bps || bps < 1) return "—";
+    return `${this.formatBytes(bps)}/s`;
+  }
+
+  private updateSpeed(bytesDone: number): void {
+    const now = Date.now();
+    if (!this.speedLastAt) {
+      this.speedLastAt = now;
+      this.speedLastBytes = bytesDone;
+      return;
+    }
+    const dt = (now - this.speedLastAt) / 1000;
+    if (dt < 0.35) return;
+    const delta = bytesDone - this.speedLastBytes;
+    if (delta >= 0) {
+      this.speedBps.set(delta / dt);
+    }
+    this.speedLastAt = now;
+    this.speedLastBytes = bytesDone;
+  }
+
+  private resetSpeed(): void {
+    this.speedBps.set(0);
+    this.speedLastAt = 0;
+    this.speedLastBytes = 0;
   }
 }

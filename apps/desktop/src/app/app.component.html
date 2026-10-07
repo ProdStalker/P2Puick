@@ -174,7 +174,8 @@
       </p>
       <p class="hint progress-meta" *ngIf="progress() as p">
         Fichiers {{ p.filesDone }}/{{ p.filesTotal }} ·
-        {{ p.bytesDone }}/{{ p.bytesTotal }} octets
+        {{ formatBytes(p.bytesDone) }} / {{ formatBytes(p.bytesTotal) }}
+        <span *ngIf="speedBps() > 0"> · {{ formatSpeed(speedBps()) }}</span>
       </p>
       <div class="cta-row">
         <button type="button" class="secondary" [disabled]="!busy()" (click)="cancel()">

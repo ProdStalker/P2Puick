@@ -1,7 +1,23 @@
-# Tauri + Angular
+# P2Puick desktop
 
-This template should help get you started developing with Tauri and Angular.
+Shell **Tauri 2 + Angular**. Voir le [README racine](../../README.md) pour l’overview.
 
-## Recommended IDE Setup
+## Scripts
 
-[VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) + [Angular Language Service](https://marketplace.visualstudio.com/items?itemName=Angular.ng-template).
+```bash
+npm install
+npm run tauri:dev    # développement
+npm run tauri:try    # build release sans updater / sans clé
+npm run tauri:build  # build complet
+npm run test:rust    # tests des crates Rust
+npm run update -- "Notes de version"
+```
+
+macOS après `tauri:try` (artefacts dans le `target/` **à la racine du monorepo**, pas dans `src-tauri/target/`) :
+
+```bash
+# depuis apps/desktop
+open ../../target/release/bundle/macos/P2Puick.app
+```
+
+Mises à jour : [docs/UPDATES.md](docs/UPDATES.md).

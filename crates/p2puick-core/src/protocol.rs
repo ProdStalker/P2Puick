@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAGIC: [u8; 4] = *b"P2PK";
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
 #[repr(u8)]
@@ -19,6 +19,10 @@ pub enum MsgType {
     Cancel = 8,
     Error = 9,
     Ready = 10,
+    /// Receiver already has a same-size file; payload carries local blake3 hash.
+    FileHave = 11,
+    /// Receiver needs the file bytes.
+    FileNeed = 12,
 }
 
 impl MsgType {
@@ -34,6 +38,8 @@ impl MsgType {
             8 => Self::Cancel,
             9 => Self::Error,
             10 => Self::Ready,
+            11 => Self::FileHave,
+            12 => Self::FileNeed,
             _ => return None,
         })
     }
@@ -64,6 +70,9 @@ pub struct FileStartPayload {
     pub relative_path: String,
     pub size: u64,
     pub hash: String,
+    /// Source modification time (Unix seconds). Used for FTP-style size+mtime skip.
+    #[serde(default)]
+    pub mtime_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +86,20 @@ pub struct AckPayload {
     pub relative_path: String,
     pub ok: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileHavePayload {
+    pub relative_path: String,
+    /// Empty when matched by size+mtime; otherwise local blake3 for host to verify.
+    pub hash: String,
+    /// `"mtime"` (FTP-style) or `"hash"`.
+    pub matched_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileNeedPayload {
+    pub relative_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +117,8 @@ pub enum Message {
     FileChunk(Vec<u8>),
     FileEnd(FileEndPayload),
     Ack(AckPayload),
+    FileHave(FileHavePayload),
+    FileNeed(FileNeedPayload),
     Cancel,
     Error(ErrorPayload),
 }
@@ -109,6 +134,8 @@ impl Message {
             Self::FileChunk(_) => MsgType::FileChunk,
             Self::FileEnd(_) => MsgType::FileEnd,
             Self::Ack(_) => MsgType::Ack,
+            Self::FileHave(_) => MsgType::FileHave,
+            Self::FileNeed(_) => MsgType::FileNeed,
             Self::Cancel => MsgType::Cancel,
             Self::Error(_) => MsgType::Error,
         }
@@ -128,6 +155,10 @@ impl Message {
                 .map_err(|e| Error::protocol(format!("serialize file end: {e}")))?,
             Self::Ack(p) => serde_json::to_vec(p)
                 .map_err(|e| Error::protocol(format!("serialize ack: {e}")))?,
+            Self::FileHave(p) => serde_json::to_vec(p)
+                .map_err(|e| Error::protocol(format!("serialize file have: {e}")))?,
+            Self::FileNeed(p) => serde_json::to_vec(p)
+                .map_err(|e| Error::protocol(format!("serialize file need: {e}")))?,
             Self::Error(p) => serde_json::to_vec(p)
                 .map_err(|e| Error::protocol(format!("serialize error: {e}")))?,
         })
@@ -154,6 +185,12 @@ impl Message {
             })?),
             MsgType::Ack => Self::Ack(serde_json::from_slice(&payload).map_err(|e| {
                 Error::protocol(format!("decode ack: {e}"))
+            })?),
+            MsgType::FileHave => Self::FileHave(serde_json::from_slice(&payload).map_err(|e| {
+                Error::protocol(format!("decode file have: {e}"))
+            })?),
+            MsgType::FileNeed => Self::FileNeed(serde_json::from_slice(&payload).map_err(|e| {
+                Error::protocol(format!("decode file need: {e}"))
             })?),
             MsgType::Cancel => Self::Cancel,
             MsgType::Error => Self::Error(serde_json::from_slice(&payload).map_err(|e| {

@@ -20,35 +20,51 @@ done
 [[ -n "$UPDATE_BASE_URL" ]] || { echo "--url required" >&2; exit 1; }
 [[ -n "$VERSION" ]] || VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
 
-export TAURI_SIGNING_PRIVATE_KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-$ROOT/src-tauri/updater.key}"
+# Prefer key file contents (Tauri build expects the private key string).
+if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" && -f "$ROOT/src-tauri/updater.key" ]]; then
+  export TAURI_SIGNING_PRIVATE_KEY
+  TAURI_SIGNING_PRIVATE_KEY="$(cat "$ROOT/src-tauri/updater.key")"
+fi
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+unset TAURI_SIGNING_PRIVATE_KEY_PATH
 
 npm run tauri build
 
-# Collect updater artifacts produced by Tauri
+# Collect updater artifacts produced by Tauri.
+# Cargo workspace → repo-root target/; fallback → src-tauri/target/.
 mkdir -p dist updates
-BUNDLE_DIR="src-tauri/target/release/bundle"
+REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+BUNDLE_DIRS=(
+  "$REPO_ROOT/target/release/bundle"
+  "$ROOT/src-tauri/target/release/bundle"
+)
 ARCHIVE=""
 SIG=""
 
-# macOS
-if [[ -f "$BUNDLE_DIR/macos/P2Puick.app.tar.gz" ]]; then
-  ARCHIVE="$BUNDLE_DIR/macos/P2Puick.app.tar.gz"
-elif ls "$BUNDLE_DIR"/macos/*.app.tar.gz >/dev/null 2>&1; then
-  ARCHIVE="$(ls "$BUNDLE_DIR"/macos/*.app.tar.gz | head -n1)"
-fi
+for BUNDLE_DIR in "${BUNDLE_DIRS[@]}"; do
+  if [[ -f "$BUNDLE_DIR/macos/P2Puick.app.tar.gz" ]]; then
+    ARCHIVE="$BUNDLE_DIR/macos/P2Puick.app.tar.gz"
+    break
+  fi
+  if ls "$BUNDLE_DIR"/macos/*.app.tar.gz >/dev/null 2>&1; then
+    ARCHIVE="$(ls "$BUNDLE_DIR"/macos/*.app.tar.gz | head -n1)"
+    break
+  fi
+done
 
 if [[ -n "$ARCHIVE" ]]; then
   cp "$ARCHIVE" "dist/P2Puick.app.tar.gz"
   [[ -f "${ARCHIVE}.sig" ]] && cp "${ARCHIVE}.sig" "dist/P2Puick.app.tar.gz.sig"
 fi
 
-# Prefer local dist copies
 ARCHIVE="dist/P2Puick.app.tar.gz"
 SIG="${ARCHIVE}.sig"
 if [[ ! -f "$ARCHIVE" || ! -f "$SIG" ]]; then
-  echo "Updater archive or signature missing. Checked $BUNDLE_DIR" >&2
-  find "$BUNDLE_DIR" -name '*.sig' 2>/dev/null | head
+  echo "Updater archive or signature missing. Checked:" >&2
+  printf '  %s\n' "${BUNDLE_DIRS[@]}" >&2
+  for BUNDLE_DIR in "${BUNDLE_DIRS[@]}"; do
+    find "$BUNDLE_DIR" -name '*.sig' 2>/dev/null | head
+  done
   exit 1
 fi
 

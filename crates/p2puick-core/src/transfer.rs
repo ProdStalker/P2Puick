@@ -2,7 +2,8 @@ use crate::error::{Error, Result};
 use crate::exclude::{default_exclude_dir_names, is_excluded_dir_name, normalize_excludes};
 use crate::protocol::{
     read_message, write_message, AckPayload, ErrorPayload, FileEndPayload, FileEntry,
-    FileStartPayload, HelloPayload, Manifest, Message, CHUNK_SIZE,
+    FileHavePayload, FileNeedPayload, FileStartPayload, HelloPayload, Manifest, Message,
+    CHUNK_SIZE,
 };
 use crate::retry_queue::{self, FailedEntry};
 use blake3::Hasher;
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -45,6 +46,8 @@ pub enum ProgressKind {
     FileStart,
     FileProgress,
     FileDone,
+    /// File already present at destination (size+mtime or matching hash).
+    FileSkipped,
     /// Single file failed but transfer may continue; queued for retry when configured.
     FileFailed,
     Complete,
@@ -741,6 +744,11 @@ struct SendReport {
     fatal: Option<Error>,
 }
 
+enum SendFileOutcome {
+    Sent,
+    Skipped,
+}
+
 fn persist_send_report(queue_path: Option<&Path>, report: &SendReport) {
     let Some(path) = queue_path else {
         return;
@@ -832,6 +840,8 @@ where
             },
         );
 
+        let mtime_unix = file_mtime_unix(abs).await.unwrap_or(0);
+
         let send_one = async {
             {
                 let mut w = writer.lock().await;
@@ -841,6 +851,7 @@ where
                         relative_path: entry.relative_path.clone(),
                         size: entry.size,
                         hash: String::new(),
+                        mtime_unix,
                     }),
                 )
                 .await
@@ -848,6 +859,47 @@ where
                     Error::Io(io) => Error::from_io(io),
                     other => other,
                 })?;
+            }
+
+            // Receiver answers FileNeed or FileHave (mtime / hash probe).
+            let offer = read_message(reader).await.map_err(|e| match e {
+                Error::Io(io) => Error::from_io(io),
+                other => other,
+            })?;
+            let mut skip = false;
+            match offer {
+                Message::FileNeed(_) => {}
+                Message::FileHave(have) if have.matched_by == "mtime" => {
+                    skip = true;
+                }
+                Message::FileHave(have) => {
+                    let local_hash = hash_path(abs).await?;
+                    if local_hash == have.hash {
+                        skip = true;
+                    }
+                }
+                Message::Cancel => return Err(Error::Cancelled),
+                other => {
+                    return Err(Error::UnexpectedMessage(format!("{other:?}")));
+                }
+            }
+
+            if skip {
+                let mut w = writer.lock().await;
+                write_message(
+                    &mut *w,
+                    &Message::Ack(AckPayload {
+                        relative_path: entry.relative_path.clone(),
+                        ok: true,
+                        message: "skip".into(),
+                    }),
+                )
+                .await
+                .map_err(|e| match e {
+                    Error::Io(io) => Error::from_io(io),
+                    other => other,
+                })?;
+                return Ok(SendFileOutcome::Skipped);
             }
 
             let mut file = File::open(abs).await.map_err(Error::from_io)?;
@@ -911,7 +963,7 @@ where
                 Error::Io(io) => Error::from_io(io),
                 other => other,
             })? {
-                Message::Ack(ack) if ack.ok => Ok(()),
+                Message::Ack(ack) if ack.ok => Ok(SendFileOutcome::Sent),
                 Message::Ack(ack) => Err(Error::Other(format!(
                     "receiver rejected {}: {}",
                     ack.relative_path, ack.message
@@ -922,7 +974,24 @@ where
         };
 
         match send_one.await {
-            Ok(()) => {
+            Ok(SendFileOutcome::Skipped) => {
+                report.sent.push(abs.to_string_lossy().into_owned());
+                bytes_done += entry.size;
+                files_done += 1;
+                throttle.send_now(
+                    &progress,
+                    ProgressEvent {
+                        kind: ProgressKind::FileSkipped,
+                        relative_path: rel.clone(),
+                        bytes_done,
+                        bytes_total,
+                        files_done,
+                        files_total,
+                        message: format!("Ignoré (déjà à jour) {rel}"),
+                    },
+                );
+            }
+            Ok(SendFileOutcome::Sent) => {
                 report.sent.push(abs.to_string_lossy().into_owned());
                 files_done += 1;
                 throttle.send_now(
@@ -1053,6 +1122,13 @@ where
                     Ok(p) => p,
                     Err(e) => {
                         let reason = e.to_string();
+                        let _ = write_message(
+                            writer,
+                            &Message::FileNeed(FileNeedPayload {
+                                relative_path: start.relative_path.clone(),
+                            }),
+                        )
+                        .await;
                         let _ = drain_until_file_end(reader).await;
                         let _ = write_message(
                             writer,
@@ -1085,6 +1161,131 @@ where
                         continue;
                     }
                 };
+
+                // FTP-style: same size + mtime → skip. Same size only → probe hash.
+                let existing = fs::metadata(&dest_path).await.ok();
+                if let Some(meta) = existing {
+                    if meta.is_file() && meta.len() == start.size {
+                        let local_mtime = meta_mtime_unix(&meta);
+                        if start.mtime_unix > 0 && mtimes_close(local_mtime, start.mtime_unix) {
+                            write_message(
+                                writer,
+                                &Message::FileHave(FileHavePayload {
+                                    relative_path: start.relative_path.clone(),
+                                    hash: String::new(),
+                                    matched_by: "mtime".into(),
+                                }),
+                            )
+                            .await?;
+                            match read_message(reader).await? {
+                                Message::Ack(ack) if ack.ok && ack.message == "skip" => {
+                                    files_done += 1;
+                                    bytes_done += start.size;
+                                    throttle.send_now(
+                                        &progress,
+                                        ProgressEvent {
+                                            kind: ProgressKind::FileSkipped,
+                                            relative_path: start.relative_path.clone(),
+                                            bytes_done,
+                                            bytes_total,
+                                            files_done,
+                                            files_total,
+                                            message: format!(
+                                                "Ignoré (taille+date) {}",
+                                                start.relative_path
+                                            ),
+                                        },
+                                    );
+                                    if files_done >= files_total {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Message::Cancel => return Err(Error::Cancelled),
+                                other => {
+                                    return Err(Error::UnexpectedMessage(format!("{other:?}")));
+                                }
+                            }
+                        }
+
+                        // Size matches but mtime differs (or missing): offer local hash.
+                        if let Ok(hash) = hash_path(&dest_path).await {
+                            write_message(
+                                writer,
+                                &Message::FileHave(FileHavePayload {
+                                    relative_path: start.relative_path.clone(),
+                                    hash,
+                                    matched_by: "hash".into(),
+                                }),
+                            )
+                            .await?;
+                            match read_message(reader).await? {
+                                Message::Ack(ack) if ack.ok && ack.message == "skip" => {
+                                    files_done += 1;
+                                    bytes_done += start.size;
+                                    throttle.send_now(
+                                        &progress,
+                                        ProgressEvent {
+                                            kind: ProgressKind::FileSkipped,
+                                            relative_path: start.relative_path.clone(),
+                                            bytes_done,
+                                            bytes_total,
+                                            files_done,
+                                            files_total,
+                                            message: format!(
+                                                "Ignoré (hash identique) {}",
+                                                start.relative_path
+                                            ),
+                                        },
+                                    );
+                                    if files_done >= files_total {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Message::FileChunk(first) => {
+                                    // Host decided to overwrite — fall through to receive.
+                                    if let Some(parent) = dest_path.parent() {
+                                        fs::create_dir_all(parent)
+                                            .await
+                                            .map_err(Error::from_io)?;
+                                    }
+                                    receive_file_body(
+                                        reader,
+                                        writer,
+                                        &dest_path,
+                                        &start,
+                                        &progress,
+                                        &mut throttle,
+                                        &mut files_done,
+                                        &mut bytes_done,
+                                        files_total,
+                                        bytes_total,
+                                        Some(first),
+                                    )
+                                    .await?;
+                                    if files_done >= files_total {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Message::Cancel => return Err(Error::Cancelled),
+                                other => {
+                                    return Err(Error::UnexpectedMessage(format!("{other:?}")));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                write_message(
+                    writer,
+                    &Message::FileNeed(FileNeedPayload {
+                        relative_path: start.relative_path.clone(),
+                    }),
+                )
+                .await?;
+
                 if let Some(parent) = dest_path.parent() {
                     if let Err(e) = fs::create_dir_all(parent).await {
                         let reason = Error::from_io(e).to_string();
@@ -1098,6 +1299,7 @@ where
                             }),
                         )
                         .await;
+                        files_done += 1;
                         throttle.send_now(
                             &progress,
                             ProgressEvent {
@@ -1110,181 +1312,27 @@ where
                                 message: format!("Échec {}: {reason}", start.relative_path),
                             },
                         );
-                        files_done += 1;
                         if files_done >= files_total {
                             break;
                         }
                         continue;
                     }
                 }
-                let mut out = match File::create(&dest_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let reason = Error::from_io(e).to_string();
-                        let _ = drain_until_file_end(reader).await;
-                        let _ = write_message(
-                            writer,
-                            &Message::Ack(AckPayload {
-                                relative_path: start.relative_path.clone(),
-                                ok: false,
-                                message: reason.clone(),
-                            }),
-                        )
-                        .await;
-                        throttle.send_now(
-                            &progress,
-                            ProgressEvent {
-                                kind: ProgressKind::FileFailed,
-                                relative_path: start.relative_path.clone(),
-                                bytes_done,
-                                bytes_total,
-                                files_done,
-                                files_total,
-                                message: format!("Échec {}: {reason}", start.relative_path),
-                            },
-                        );
-                        files_done += 1;
-                        if files_done >= files_total {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let mut hasher = Hasher::new();
-                let mut received = 0u64;
-                let mut file_failed = false;
 
-                loop {
-                    match read_message(reader).await.map_err(|e| match e {
-                        Error::Io(io) => Error::from_io(io),
-                        other => other,
-                    })? {
-                        Message::FileChunk(chunk) => {
-                            if let Err(e) = out.write_all(&chunk).await {
-                                file_failed = true;
-                                let reason = Error::from_io(e).to_string();
-                                drop(out);
-                                let _ = fs::remove_file(&dest_path).await;
-                                let _ = drain_until_file_end(reader).await;
-                                let _ = write_message(
-                                    writer,
-                                    &Message::Ack(AckPayload {
-                                        relative_path: start.relative_path.clone(),
-                                        ok: false,
-                                        message: reason.clone(),
-                                    }),
-                                )
-                                .await;
-                                throttle.send_now(
-                                    &progress,
-                                    ProgressEvent {
-                                        kind: ProgressKind::FileFailed,
-                                        relative_path: start.relative_path.clone(),
-                                        bytes_done,
-                                        bytes_total,
-                                        files_done,
-                                        files_total,
-                                        message: format!(
-                                            "Échec {}: {reason}",
-                                            start.relative_path
-                                        ),
-                                    },
-                                );
-                                break;
-                            }
-                            hasher.update(&chunk);
-                            received += chunk.len() as u64;
-                            bytes_done += chunk.len() as u64;
-                            throttle.send_throttled(
-                                &progress,
-                                ProgressEvent {
-                                    kind: ProgressKind::FileProgress,
-                                    relative_path: start.relative_path.clone(),
-                                    bytes_done,
-                                    bytes_total,
-                                    files_done,
-                                    files_total,
-                                    message: format!("{received}/{}", start.size),
-                                },
-                            );
-                        }
-                        Message::FileEnd(end) => {
-                            if file_failed {
-                                break;
-                            }
-                            out.flush().await.map_err(Error::from_io)?;
-                            drop(out);
-                            let actual = hasher.finalize().to_hex().to_string();
-                            let expected = if !end.hash.is_empty() {
-                                end.hash.clone()
-                            } else {
-                                start.hash.clone()
-                            };
-                            if actual != expected {
-                                let _ = fs::remove_file(&dest_path).await;
-                                write_message(
-                                    writer,
-                                    &Message::Ack(AckPayload {
-                                        relative_path: start.relative_path.clone(),
-                                        ok: false,
-                                        message: format!(
-                                            "hash mismatch expected {expected} got {actual}"
-                                        ),
-                                    }),
-                                )
-                                .await?;
-                                files_done += 1;
-                                throttle.send_now(
-                                    &progress,
-                                    ProgressEvent {
-                                        kind: ProgressKind::FileFailed,
-                                        relative_path: start.relative_path.clone(),
-                                        bytes_done,
-                                        bytes_total,
-                                        files_done,
-                                        files_total,
-                                        message: format!(
-                                            "Hash incorrect pour {} (hôte peut renvoyer)",
-                                            start.relative_path
-                                        ),
-                                    },
-                                );
-                                break;
-                            }
-                            write_message(
-                                writer,
-                                &Message::Ack(AckPayload {
-                                    relative_path: start.relative_path.clone(),
-                                    ok: true,
-                                    message: "ok".into(),
-                                }),
-                            )
-                            .await?;
-                            files_done += 1;
-                            throttle.send_now(
-                                &progress,
-                                ProgressEvent {
-                                    kind: ProgressKind::FileDone,
-                                    relative_path: start.relative_path.clone(),
-                                    bytes_done,
-                                    bytes_total,
-                                    files_done,
-                                    files_total,
-                                    message: format!("OK {}", start.relative_path),
-                                },
-                            );
-                            break;
-                        }
-                        Message::Cancel => return Err(Error::Cancelled),
-                        other => {
-                            return Err(Error::UnexpectedMessage(format!("{other:?}")));
-                        }
-                    }
-                }
-
-                if file_failed {
-                    files_done += 1;
-                }
+                receive_file_body(
+                    reader,
+                    writer,
+                    &dest_path,
+                    &start,
+                    &progress,
+                    &mut throttle,
+                    &mut files_done,
+                    &mut bytes_done,
+                    files_total,
+                    bytes_total,
+                    None,
+                )
+                .await?;
 
                 if files_done >= files_total {
                     break;
@@ -1314,6 +1362,216 @@ where
     Ok(())
 }
 
+/// Receive file bytes (optionally starting with an already-read first chunk).
+#[allow(clippy::too_many_arguments)]
+async fn receive_file_body<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    dest_path: &Path,
+    start: &FileStartPayload,
+    progress: &mpsc::UnboundedSender<ProgressEvent>,
+    throttle: &mut ProgressThrottle,
+    files_done: &mut u64,
+    bytes_done: &mut u64,
+    files_total: u64,
+    bytes_total: u64,
+    first_chunk: Option<Vec<u8>>,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut out = match File::create(dest_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let reason = Error::from_io(e).to_string();
+            let _ = drain_until_file_end(reader).await;
+            let _ = write_message(
+                writer,
+                &Message::Ack(AckPayload {
+                    relative_path: start.relative_path.clone(),
+                    ok: false,
+                    message: reason.clone(),
+                }),
+            )
+            .await;
+            *files_done += 1;
+            throttle.send_now(
+                progress,
+                ProgressEvent {
+                    kind: ProgressKind::FileFailed,
+                    relative_path: start.relative_path.clone(),
+                    bytes_done: *bytes_done,
+                    bytes_total,
+                    files_done: *files_done,
+                    files_total,
+                    message: format!("Échec {}: {reason}", start.relative_path),
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    let mut hasher = Hasher::new();
+    let mut received = 0u64;
+
+    if let Some(chunk) = first_chunk {
+        if let Err(e) = out.write_all(&chunk).await {
+            let reason = Error::from_io(e).to_string();
+            drop(out);
+            let _ = fs::remove_file(dest_path).await;
+            let _ = drain_until_file_end(reader).await;
+            let _ = write_message(
+                writer,
+                &Message::Ack(AckPayload {
+                    relative_path: start.relative_path.clone(),
+                    ok: false,
+                    message: reason.clone(),
+                }),
+            )
+            .await;
+            *files_done += 1;
+            throttle.send_now(
+                progress,
+                ProgressEvent {
+                    kind: ProgressKind::FileFailed,
+                    relative_path: start.relative_path.clone(),
+                    bytes_done: *bytes_done,
+                    bytes_total,
+                    files_done: *files_done,
+                    files_total,
+                    message: format!("Échec {}: {reason}", start.relative_path),
+                },
+            );
+            return Ok(());
+        }
+        hasher.update(&chunk);
+        received += chunk.len() as u64;
+        *bytes_done += chunk.len() as u64;
+    }
+
+    loop {
+        match read_message(reader).await.map_err(|e| match e {
+            Error::Io(io) => Error::from_io(io),
+            other => other,
+        })? {
+            Message::FileChunk(chunk) => {
+                if let Err(e) = out.write_all(&chunk).await {
+                    let reason = Error::from_io(e).to_string();
+                    drop(out);
+                    let _ = fs::remove_file(dest_path).await;
+                    let _ = drain_until_file_end(reader).await;
+                    let _ = write_message(
+                        writer,
+                        &Message::Ack(AckPayload {
+                            relative_path: start.relative_path.clone(),
+                            ok: false,
+                            message: reason.clone(),
+                        }),
+                    )
+                    .await;
+                    *files_done += 1;
+                    throttle.send_now(
+                        progress,
+                        ProgressEvent {
+                            kind: ProgressKind::FileFailed,
+                            relative_path: start.relative_path.clone(),
+                            bytes_done: *bytes_done,
+                            bytes_total,
+                            files_done: *files_done,
+                            files_total,
+                            message: format!("Échec {}: {reason}", start.relative_path),
+                        },
+                    );
+                    return Ok(());
+                }
+                hasher.update(&chunk);
+                received += chunk.len() as u64;
+                *bytes_done += chunk.len() as u64;
+                throttle.send_throttled(
+                    progress,
+                    ProgressEvent {
+                        kind: ProgressKind::FileProgress,
+                        relative_path: start.relative_path.clone(),
+                        bytes_done: *bytes_done,
+                        bytes_total,
+                        files_done: *files_done,
+                        files_total,
+                        message: format!("{received}/{}", start.size),
+                    },
+                );
+            }
+            Message::FileEnd(end) => {
+                out.flush().await.map_err(Error::from_io)?;
+                drop(out);
+                let actual = hasher.finalize().to_hex().to_string();
+                let expected = if !end.hash.is_empty() {
+                    end.hash.clone()
+                } else {
+                    start.hash.clone()
+                };
+                if actual != expected {
+                    let _ = fs::remove_file(dest_path).await;
+                    write_message(
+                        writer,
+                        &Message::Ack(AckPayload {
+                            relative_path: start.relative_path.clone(),
+                            ok: false,
+                            message: format!("hash mismatch expected {expected} got {actual}"),
+                        }),
+                    )
+                    .await?;
+                    *files_done += 1;
+                    throttle.send_now(
+                        progress,
+                        ProgressEvent {
+                            kind: ProgressKind::FileFailed,
+                            relative_path: start.relative_path.clone(),
+                            bytes_done: *bytes_done,
+                            bytes_total,
+                            files_done: *files_done,
+                            files_total,
+                            message: format!(
+                                "Hash incorrect pour {} (hôte peut renvoyer)",
+                                start.relative_path
+                            ),
+                        },
+                    );
+                    return Ok(());
+                }
+                if start.mtime_unix > 0 {
+                    let _ = set_file_mtime_unix(dest_path, start.mtime_unix).await;
+                }
+                write_message(
+                    writer,
+                    &Message::Ack(AckPayload {
+                        relative_path: start.relative_path.clone(),
+                        ok: true,
+                        message: "ok".into(),
+                    }),
+                )
+                .await?;
+                *files_done += 1;
+                throttle.send_now(
+                    progress,
+                    ProgressEvent {
+                        kind: ProgressKind::FileDone,
+                        relative_path: start.relative_path.clone(),
+                        bytes_done: *bytes_done,
+                        bytes_total,
+                        files_done: *files_done,
+                        files_total,
+                        message: format!("OK {}", start.relative_path),
+                    },
+                );
+                return Ok(());
+            }
+            Message::Cancel => return Err(Error::Cancelled),
+            other => return Err(Error::UnexpectedMessage(format!("{other:?}"))),
+        }
+    }
+}
+
 /// Discard chunks until FileEnd after a per-file setup failure.
 async fn drain_until_file_end<R>(reader: &mut R) -> Result<()>
 where
@@ -1330,6 +1588,51 @@ where
             other => return Err(Error::UnexpectedMessage(format!("{other:?}"))),
         }
     }
+}
+
+async fn hash_path(path: &Path) -> Result<String> {
+    let mut file = File::open(path).await.map_err(Error::from_io)?;
+    let mut hasher = Hasher::new();
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).await.map_err(Error::from_io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+async fn file_mtime_unix(path: &Path) -> Result<u64> {
+    let meta = fs::metadata(path).await.map_err(Error::from_io)?;
+    Ok(meta_mtime_unix(&meta))
+}
+
+fn meta_mtime_unix(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Allow 2s skew (FAT / some network FS round mtimes).
+fn mtimes_close(a: u64, b: u64) -> bool {
+    a.abs_diff(b) <= 2
+}
+
+async fn set_file_mtime_unix(path: &Path, mtime_unix: u64) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let modified = UNIX_EPOCH + Duration::from_secs(mtime_unix);
+        let file = std::fs::File::options().write(true).open(&path)?;
+        file.set_modified(modified)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("set mtime join: {e}")))?
+    .map_err(Error::from_io)
 }
 
 /// Normalize wire paths to `/`-separated relative form (no drive/root prefix).

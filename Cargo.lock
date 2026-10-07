@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "p2puick"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "p2puick-core",

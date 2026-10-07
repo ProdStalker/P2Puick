@@ -22,3 +22,5 @@ apps/desktop/src-tauri/WixTools/
 # Local release artifacts
 apps/desktop/updates/latest.json
 !apps/desktop/updates/.gitkeep
+apps/desktop/updates/changelog.json
+apps/desktop/dist/

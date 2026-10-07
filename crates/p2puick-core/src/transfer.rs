@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::exclude::{default_exclude_dir_names, is_excluded_dir_name, normalize_excludes};
 use crate::protocol::{
     read_message, write_message, AckPayload, ErrorPayload, FileEndPayload, FileEntry,
     FileStartPayload, HelloPayload, Manifest, Message, CHUNK_SIZE,
@@ -50,6 +51,8 @@ pub struct SessionConfig {
     pub pairing_code: String,
     pub hostname: String,
     pub concurrency: usize,
+    /// Directory names to skip while walking (e.g. `node_modules`).
+    pub exclude_dir_names: Vec<String>,
 }
 
 impl Default for SessionConfig {
@@ -58,6 +61,7 @@ impl Default for SessionConfig {
             pairing_code: String::new(),
             hostname: hostname(),
             concurrency: DEFAULT_CONCURRENCY,
+            exclude_dir_names: default_exclude_dir_names(),
         }
     }
 }
@@ -94,8 +98,9 @@ impl TransferSession {
         let prep_progress = progress.clone();
         let prep_cancel = self.cancel.clone();
         let prep_paths = source_paths.clone();
+        let excludes = normalize_excludes(&config.exclude_dir_names);
         let prep_task = tokio::spawn(async move {
-            build_manifest(&prep_paths, Some(&prep_progress), &prep_cancel).await
+            build_manifest(&prep_paths, Some(&prep_progress), &prep_cancel, &excludes).await
         });
 
         let listener = bind_listener(port).await.map_err(|e| map_bind_error(e, port))?;
@@ -360,6 +365,7 @@ async fn build_manifest(
     paths: &[PathBuf],
     progress: Option<&mpsc::UnboundedSender<ProgressEvent>>,
     cancel: &AtomicBool,
+    excludes: &[String],
 ) -> Result<(Manifest, RootMap)> {
     let mut files = Vec::new();
     let mut roots = Vec::new();
@@ -380,7 +386,13 @@ async fn build_manifest(
         }
     };
 
-    emit("Indexation des fichiers…".into(), 0);
+    emit(
+        format!(
+            "Indexation des fichiers ({} exclusion(s))…",
+            excludes.len()
+        ),
+        0,
+    );
 
     for path in paths {
         if cancel.load(Ordering::SeqCst) {
@@ -405,10 +417,37 @@ async fn build_manifest(
             });
             roots.push((name, path));
         } else if meta.is_dir() {
+            // If the selected root itself is an excluded name, skip entirely.
+            if let Some(root_name) = path.file_name().and_then(|n| n.to_str()) {
+                if is_excluded_dir_name(root_name, excludes) {
+                    emit(
+                        format!("Dossier exclu (racine) : {root_name}"),
+                        indexed,
+                    );
+                    continue;
+                }
+            }
+
             let base = path.clone();
-            for entry in WalkDir::new(&path).into_iter().filter_map(|e| e.ok()) {
+            let walker = WalkDir::new(&path).into_iter().filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                if e.file_type().is_dir() {
+                    let name = e.file_name().to_string_lossy();
+                    !is_excluded_dir_name(&name, excludes)
+                } else {
+                    true
+                }
+            });
+
+            for entry in walker.filter_map(|e| e.ok()) {
                 if cancel.load(Ordering::SeqCst) {
                     return Err(Error::Cancelled);
+                }
+                if entry.file_type().is_dir() {
+                    // Count skipped dirs via filter — only emit when we would have entered
+                    continue;
                 }
                 if !entry.file_type().is_file() {
                     continue;
@@ -419,6 +458,13 @@ async fn build_manifest(
                     .unwrap_or(entry.path())
                     .to_string_lossy()
                     .replace('\\', "/");
+                // Safety: also skip if any path component is excluded
+                if rel
+                    .split('/')
+                    .any(|part| is_excluded_dir_name(part, excludes))
+                {
+                    continue;
+                }
                 emit(format!("Hash blake3 : {rel}"), indexed);
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let hash = hash_file(&abs).await?;

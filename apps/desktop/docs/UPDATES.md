@@ -33,6 +33,8 @@ npx tauri signer generate -w src-tauri/updater.key -f --ci
 
 ## Publish an update
 
+macOS releases are built as a **universal2** binary (`arm64` + `x86_64`) so Apple Silicon and Intel Macs share the same `P2Puick.app.tar.gz`.
+
 ```bash
 cd apps/desktop
 npm run update -- "Notes de version"
@@ -45,6 +47,8 @@ npm run update -- --minor "Nouvelle fonctionnalité"
 npm run update -- --version 0.2.0 --notes "Fixes."
 npm run update -- --no-upload --notes "WIP"
 ```
+
+`latest.json` lists both `darwin-aarch64` and `darwin-x86_64` pointing at the same universal archive.
 
 ## In the app
 

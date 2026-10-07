@@ -37,11 +37,11 @@ npm run tauri:dev
 | `npm run tauri:try` | Build release local **sans** artefacts updater (pas besoin de clé de signature) |
 | `npm run tauri:build` | Build complet (updater inclus, clé privée requise si `createUpdaterArtifacts`) |
 | `npm run test:rust` | Tests Rust (`p2puick-core`, `p2puick-discovery`) |
-| `npm run update -- "notes"` | Bump + build signé + publish vers `p2puick-updates` |
+| `npm run update -- "notes"` | Bump + build **universal** macOS (Intel + Apple Silicon) signé + publish |
 
 ### Essayer en release (local)
 
-Build optimisé **sans** signature updater. Le workspace Cargo place les artefacts à la **racine du repo** (`P2Puick/target/…`), pas sous `apps/desktop/src-tauri/target/`.
+Build optimisé **sans** signature updater (arch native). Le workspace Cargo place les artefacts à la **racine du repo** (`P2Puick/target/…`), pas sous `apps/desktop/src-tauri/target/`.
 
 ```bash
 cd apps/desktop
@@ -52,6 +52,8 @@ open ../../target/release/bundle/macos/P2Puick.app
 # ou depuis la racine du repo :
 # open target/release/bundle/macos/P2Puick.app
 ```
+
+Les releases publiées (`npm run update`) sont **universal** (Intel + Apple Silicon) sous `target/universal-apple-darwin/release/bundle/macos/`.
 
 Si tu as déjà build et que seule la signature a échoué, le `.app` est quand même là — `open` suffit.
 

@@ -35,6 +35,7 @@ pub struct ProgressEvent {
 #[serde(rename_all = "camelCase")]
 pub enum ProgressKind {
     Connected,
+    Preparing,
     Manifest,
     FileStart,
     FileProgress,
@@ -89,6 +90,14 @@ impl TransferSession {
         source_paths: Vec<PathBuf>,
         progress: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
+        // Hash while waiting for the peer — avoids a long silent stall after connect.
+        let prep_progress = progress.clone();
+        let prep_cancel = self.cancel.clone();
+        let prep_paths = source_paths.clone();
+        let prep_task = tokio::spawn(async move {
+            build_manifest(&prep_paths, Some(&prep_progress), &prep_cancel).await
+        });
+
         let listener = bind_listener(port).await.map_err(|e| map_bind_error(e, port))?;
         let _ = progress.send(ProgressEvent {
             kind: ProgressKind::Connected,
@@ -101,7 +110,6 @@ impl TransferSession {
         });
 
         let (stream, peer) = accept_one(&listener, &self.cancel).await?;
-        // Drop listener ASAP so the port is free for a later session.
         drop(listener);
 
         tracing::info!("peer connected from {peer}");
@@ -112,14 +120,13 @@ impl TransferSession {
             bytes_total: 0,
             files_done: 0,
             files_total: 0,
-            message: format!("Connecté à {peer}"),
+            message: format!("Pair connecté ({})", peer.ip()),
         });
 
         let (reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let mut reader = reader;
 
-        // Expect Hello from joiner
         match read_message(&mut reader).await? {
             Message::Hello(hello) => {
                 if hello.pairing_code.trim() != config.pairing_code.trim() {
@@ -131,10 +138,12 @@ impl TransferSession {
                         }),
                     )
                     .await?;
+                    prep_task.abort();
                     return Err(Error::PairingRejected);
                 }
             }
             other => {
+                prep_task.abort();
                 return Err(Error::UnexpectedMessage(format!("{other:?}")));
             }
         }
@@ -152,14 +161,38 @@ impl TransferSession {
             .await?;
         }
 
-        // Wait until destination picked a folder
+        let _ = progress.send(ProgressEvent {
+            kind: ProgressKind::Preparing,
+            relative_path: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
+            files_done: 0,
+            files_total: 0,
+            message: "Handshake OK — finalisation du manifeste…".into(),
+        });
+
         match read_message(&mut reader).await? {
             Message::Ready => {}
-            Message::Cancel => return Err(Error::Cancelled),
-            other => return Err(Error::UnexpectedMessage(format!("{other:?}"))),
+            Message::Cancel => {
+                prep_task.abort();
+                return Err(Error::Cancelled);
+            }
+            other => {
+                prep_task.abort();
+                return Err(Error::UnexpectedMessage(format!("{other:?}")));
+            }
         }
 
-        let (manifest, roots) = build_manifest(&source_paths).await?;
+        let (manifest, roots) = prep_task
+            .await
+            .map_err(|e| Error::Other(format!("préparation interrompue: {e}")))??;
+
+        if manifest.files.is_empty() {
+            return Err(Error::Other(
+                "Aucun fichier à envoyer (sélection vide ou dossier sans fichiers).".into(),
+            ));
+        }
+
         let files_total = manifest.files.len() as u64;
         let bytes_total = manifest.total_bytes;
         let _ = progress.send(ProgressEvent {
@@ -169,7 +202,7 @@ impl TransferSession {
             bytes_total,
             files_done: 0,
             files_total,
-            message: format!("{files_total} fichier(s)"),
+            message: format!("Envoi de {files_total} fichier(s)…"),
         });
 
         {
@@ -199,7 +232,10 @@ impl TransferSession {
         progress: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
         let stream = TcpStream::connect(addr).await?;
-        let peer = stream.peer_addr().ok();
+        let peer_label = stream
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| addr.to_string());
         let _ = progress.send(ProgressEvent {
             kind: ProgressKind::Connected,
             relative_path: String::new(),
@@ -207,7 +243,7 @@ impl TransferSession {
             bytes_total: 0,
             files_done: 0,
             files_total: 0,
-            message: format!("Connecté à {:?}", peer),
+            message: format!("Connecté à l’hôte {peer_label}"),
         });
 
         let (mut reader, mut writer) = stream.into_split();
@@ -231,6 +267,16 @@ impl TransferSession {
         }
 
         write_message(&mut writer, &Message::Ready).await?;
+
+        let _ = progress.send(ProgressEvent {
+            kind: ProgressKind::Preparing,
+            relative_path: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
+            files_done: 0,
+            files_total: 0,
+            message: "En attente du manifeste (l’hôte indexe/hash les fichiers)…".into(),
+        });
 
         let manifest = match read_message(&mut reader).await? {
             Message::Manifest(m) => m,
@@ -310,12 +356,36 @@ async fn accept_one(
 /// Map relative path → absolute source root file path.
 type RootMap = Vec<(String, PathBuf)>;
 
-async fn build_manifest(paths: &[PathBuf]) -> Result<(Manifest, RootMap)> {
+async fn build_manifest(
+    paths: &[PathBuf],
+    progress: Option<&mpsc::UnboundedSender<ProgressEvent>>,
+    cancel: &AtomicBool,
+) -> Result<(Manifest, RootMap)> {
     let mut files = Vec::new();
     let mut roots = Vec::new();
     let mut total_bytes = 0u64;
+    let mut indexed = 0u64;
+
+    let emit = |message: String, files_done: u64| {
+        if let Some(tx) = progress {
+            let _ = tx.send(ProgressEvent {
+                kind: ProgressKind::Preparing,
+                relative_path: String::new(),
+                bytes_done: 0,
+                bytes_total: 0,
+                files_done,
+                files_total: 0,
+                message,
+            });
+        }
+    };
+
+    emit("Indexation des fichiers…".into(), 0);
 
     for path in paths {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
         let path = fs::canonicalize(path).await.unwrap_or_else(|_| path.clone());
         let meta = fs::metadata(&path).await?;
         if meta.is_file() {
@@ -323,9 +393,11 @@ async fn build_manifest(paths: &[PathBuf]) -> Result<(Manifest, RootMap)> {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".into());
+            emit(format!("Hash blake3 : {name}"), indexed);
             let hash = hash_file(&path).await?;
             let size = meta.len();
             total_bytes += size;
+            indexed += 1;
             files.push(FileEntry {
                 relative_path: name.clone(),
                 size,
@@ -335,6 +407,9 @@ async fn build_manifest(paths: &[PathBuf]) -> Result<(Manifest, RootMap)> {
         } else if meta.is_dir() {
             let base = path.clone();
             for entry in WalkDir::new(&path).into_iter().filter_map(|e| e.ok()) {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(Error::Cancelled);
+                }
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -344,9 +419,11 @@ async fn build_manifest(paths: &[PathBuf]) -> Result<(Manifest, RootMap)> {
                     .unwrap_or(entry.path())
                     .to_string_lossy()
                     .replace('\\', "/");
+                emit(format!("Hash blake3 : {rel}"), indexed);
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let hash = hash_file(&abs).await?;
                 total_bytes += size;
+                indexed += 1;
                 files.push(FileEntry {
                     relative_path: rel.clone(),
                     size,
@@ -356,6 +433,11 @@ async fn build_manifest(paths: &[PathBuf]) -> Result<(Manifest, RootMap)> {
             }
         }
     }
+
+    emit(
+        format!("Manifeste prêt ({indexed} fichier(s))."),
+        indexed,
+    );
 
     Ok((
         Manifest {

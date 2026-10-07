@@ -1,0 +1,125 @@
+<div class="shell">
+  <header class="top">
+    <div class="brand" (click)="goHome()" role="button" tabindex="0">
+      <img src="assets/p2puick-logo.png" alt="P2Puick" class="logo" />
+      <div>
+        <h1>P2Puick</h1>
+        <p>Transfert P2P sur le réseau local</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span class="version" *ngIf="version()">v{{ version() }}</span>
+      <button type="button" class="ghost" (click)="openHistory()">Historique</button>
+      <button type="button" class="ghost" (click)="openUpdates()">Mises à jour</button>
+    </div>
+  </header>
+
+  <main>
+    <p class="status-line">{{ status() }}</p>
+    <p class="error" *ngIf="error()">{{ error() }}</p>
+
+    <section *ngIf="mode() === 'home'" class="hero panel">
+      <h2>Deux ordinateurs. Un réseau. Zéro clé USB.</h2>
+      <p class="lead">
+        Connecte les deux machines au même Wi‑Fi, héberge sur l’ancien PC, rejoins depuis le nouveau.
+      </p>
+      <div class="cta-row">
+        <button type="button" class="primary" [disabled]="busy()" (click)="startHost()">
+          Héberger
+        </button>
+        <button type="button" class="secondary" [disabled]="busy()" (click)="goJoin()">
+          Rejoindre
+        </button>
+      </div>
+    </section>
+
+    <section *ngIf="mode() === 'host'" class="panel">
+      <h2>Session hôte</h2>
+      <div class="code-block">{{ pairingCode() }}</div>
+      <p class="hint">Partage ce code avec le PC destination, puis sélectionne ce que tu veux envoyer.</p>
+
+      <div class="list" *ngIf="selectedPaths().length">
+        <div class="list-item" *ngFor="let path of selectedPaths()">{{ path }}</div>
+      </div>
+
+      <div class="cta-row">
+        <button type="button" class="secondary" (click)="pickSources()">Fichiers…</button>
+        <button type="button" class="secondary" (click)="pickSourceFolder()">Dossier…</button>
+        <button
+          type="button"
+          class="primary"
+          [disabled]="busy() || !selectedPaths().length"
+          (click)="launchSend()"
+        >
+          Attendre le pair &amp; envoyer
+        </button>
+        <button type="button" class="ghost" (click)="stopHost()">Annuler</button>
+      </div>
+      <p class="hint">
+        Clique sur envoyer <strong>avant</strong> que l’autre PC rejoigne : l’hôte écoute alors la connexion.
+      </p>
+    </section>
+
+    <section *ngIf="mode() === 'join'" class="panel">
+      <h2>Rejoindre une session</h2>
+      <label class="field">
+        <span>Code à 6 chiffres</span>
+        <input [(ngModel)]="joinCode" maxlength="6" placeholder="123456" />
+      </label>
+      <label class="field">
+        <span>IP manuelle (optionnel)</span>
+        <input [(ngModel)]="manualHost" placeholder="192.168.1.20" />
+      </label>
+      <label class="field">
+        <span>Port</span>
+        <input type="number" [(ngModel)]="manualPort" />
+      </label>
+      <p class="hint" *ngIf="destDir()">Destination : {{ destDir() }}</p>
+      <div class="cta-row">
+        <button type="button" class="secondary" (click)="pickDest()">Dossier destination…</button>
+        <button
+          type="button"
+          class="primary"
+          [disabled]="busy()"
+          (click)="joinAndReceive()"
+        >
+          Rejoindre &amp; recevoir
+        </button>
+        <button type="button" class="ghost" (click)="goHome()">Retour</button>
+      </div>
+    </section>
+
+    <section *ngIf="mode() === 'transfer'" class="panel">
+      <h2>Transfert</h2>
+      <div class="progress">
+        <div class="bar" [style.width.%]="progressPercent()"></div>
+      </div>
+      <p class="mono">{{ progressPercent() }}% — {{ progress()?.message || "…" }}</p>
+      <p class="hint" *ngIf="progress() as p">
+        Fichiers {{ p.filesDone }}/{{ p.filesTotal }} ·
+        {{ p.bytesDone }}/{{ p.bytesTotal }} octets
+      </p>
+      <div class="cta-row">
+        <button type="button" class="secondary" [disabled]="!busy()" (click)="cancel()">
+          Annuler
+        </button>
+        <button type="button" class="ghost" [disabled]="busy()" (click)="goHome()">
+          Terminé
+        </button>
+      </div>
+    </section>
+
+    <section *ngIf="mode() === 'history'" class="panel">
+      <h2>Historique des versions</h2>
+      <div *ngIf="!changelog().length" class="hint">Aucune entrée pour le moment.</div>
+      <article class="change" *ngFor="let entry of changelog()">
+        <header>
+          <strong>v{{ entry.version }}</strong>
+          <span>{{ formatDate(entry.date) }}</span>
+        </header>
+        <p>{{ entry.notes }}</p>
+      </article>
+      <button type="button" class="ghost" (click)="goHome()">Retour</button>
+    </section>
+  </main>
+</div>

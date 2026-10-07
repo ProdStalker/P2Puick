@@ -10,12 +10,15 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex};
 use walkdir::WalkDir;
+
+/// Min interval between high-frequency progress events (avoids flooding Tauri IPC).
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
 pub const DEFAULT_CONCURRENCY: usize = 4;
 pub const DEFAULT_PORT: u16 = 47821;
@@ -94,13 +97,14 @@ impl TransferSession {
         source_paths: Vec<PathBuf>,
         progress: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
-        // Hash while waiting for the peer — avoids a long silent stall after connect.
+        // Fast size inventory (no hashing) while waiting for the peer.
+        // Files are blake3-hashed on the fly during send — one I/O pass.
         let prep_progress = progress.clone();
         let prep_cancel = self.cancel.clone();
         let prep_paths = source_paths.clone();
         let excludes = normalize_excludes(&config.exclude_dir_names);
         let prep_task = tokio::spawn(async move {
-            build_manifest(&prep_paths, Some(&prep_progress), &prep_cancel, &excludes).await
+            scan_inventory(&prep_paths, Some(&prep_progress), &prep_cancel, &excludes).await
         });
 
         let listener = bind_listener(port).await.map_err(|e| map_bind_error(e, port))?;
@@ -116,6 +120,7 @@ impl TransferSession {
 
         let (stream, peer) = accept_one(&listener, &self.cancel).await?;
         drop(listener);
+        tune_tcp(&stream);
 
         tracing::info!("peer connected from {peer}");
         let _ = progress.send(ProgressEvent {
@@ -173,10 +178,13 @@ impl TransferSession {
             bytes_total: 0,
             files_done: 0,
             files_total: 0,
-            message: "Handshake OK — finalisation du manifeste…".into(),
+            message: "Handshake OK — inventaire des fichiers…".into(),
         });
 
-        match read_message(&mut reader).await? {
+        match read_message(&mut reader).await.map_err(|e| match e {
+            Error::Io(io) => Error::from_io(io),
+            other => other,
+        })? {
             Message::Ready => {}
             Message::Cancel => {
                 prep_task.abort();
@@ -207,7 +215,7 @@ impl TransferSession {
             bytes_total,
             files_done: 0,
             files_total,
-            message: format!("Envoi de {files_total} fichier(s)…"),
+            message: format!("Envoi de {files_total} fichier(s) (hash à la volée)…"),
         });
 
         {
@@ -220,7 +228,6 @@ impl TransferSession {
             &mut reader,
             &roots,
             &manifest.files,
-            config.concurrency,
             self.cancel.clone(),
             progress,
             bytes_total,
@@ -236,7 +243,8 @@ impl TransferSession {
         dest_dir: PathBuf,
         progress: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(addr).await.map_err(Error::from_io)?;
+        tune_tcp(&stream);
         let peer_label = stream
             .peer_addr()
             .map(|a| a.ip().to_string())
@@ -280,7 +288,7 @@ impl TransferSession {
             bytes_total: 0,
             files_done: 0,
             files_total: 0,
-            message: "En attente du manifeste (l’hôte indexe/hash les fichiers)…".into(),
+            message: "En attente du manifeste (inventaire côté hôte)…".into(),
         });
 
         let manifest = match read_message(&mut reader).await? {
@@ -337,7 +345,53 @@ fn map_bind_error(err: std::io::Error, port: u16) -> Error {
             "Le port {port} est déjà utilisé. Ferme l’autre session P2Puick (ou quitte l’app) puis réessaie."
         ))
     } else {
-        Error::Io(err)
+        Error::from_io(err)
+    }
+}
+
+fn tune_tcp(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_keepalive(true);
+}
+
+struct ProgressThrottle {
+    last: Instant,
+    pending: Option<ProgressEvent>,
+}
+
+impl ProgressThrottle {
+    fn new() -> Self {
+        Self {
+            last: Instant::now()
+                .checked_sub(PROGRESS_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            pending: None,
+        }
+    }
+
+    fn send_now(&mut self, tx: &mpsc::UnboundedSender<ProgressEvent>, ev: ProgressEvent) {
+        self.pending = None;
+        let _ = tx.send(ev);
+        self.last = Instant::now();
+    }
+
+    fn send_throttled(&mut self, tx: &mpsc::UnboundedSender<ProgressEvent>, ev: ProgressEvent) {
+        let now = Instant::now();
+        if now.duration_since(self.last) >= PROGRESS_MIN_INTERVAL {
+            self.pending = None;
+            let _ = tx.send(ev);
+            self.last = now;
+        } else {
+            self.pending = Some(ev);
+        }
+    }
+
+    fn flush(&mut self, tx: &mpsc::UnboundedSender<ProgressEvent>) {
+        if let Some(ev) = self.pending.take() {
+            let _ = tx.send(ev);
+            self.last = Instant::now();
+        }
     }
 }
 
@@ -352,7 +406,7 @@ async fn accept_one(
         }
         match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
             Ok(Ok(pair)) => return Ok(pair),
-            Ok(Err(e)) => return Err(Error::Io(e)),
+            Ok(Err(e)) => return Err(Error::from_io(e)),
             Err(_elapsed) => continue,
         }
     }
@@ -361,7 +415,8 @@ async fn accept_one(
 /// Map relative path → absolute source root file path.
 type RootMap = Vec<(String, PathBuf)>;
 
-async fn build_manifest(
+/// Fast walk: collect paths + sizes only (no blake3). Hash happens during send.
+async fn scan_inventory(
     paths: &[PathBuf],
     progress: Option<&mpsc::UnboundedSender<ProgressEvent>>,
     cancel: &AtomicBool,
@@ -371,24 +426,45 @@ async fn build_manifest(
     let mut roots = Vec::new();
     let mut total_bytes = 0u64;
     let mut indexed = 0u64;
+    let mut throttle = ProgressThrottle::new();
 
-    let emit = |message: String, files_done: u64| {
+    let emit_now = |throttle: &mut ProgressThrottle, message: String, files_done: u64| {
         if let Some(tx) = progress {
-            let _ = tx.send(ProgressEvent {
-                kind: ProgressKind::Preparing,
-                relative_path: String::new(),
-                bytes_done: 0,
-                bytes_total: 0,
-                files_done,
-                files_total: 0,
-                message,
-            });
+            throttle.send_now(
+                tx,
+                ProgressEvent {
+                    kind: ProgressKind::Preparing,
+                    relative_path: String::new(),
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    files_done,
+                    files_total: 0,
+                    message,
+                },
+            );
+        }
+    };
+    let emit = |throttle: &mut ProgressThrottle, message: String, files_done: u64| {
+        if let Some(tx) = progress {
+            throttle.send_throttled(
+                tx,
+                ProgressEvent {
+                    kind: ProgressKind::Preparing,
+                    relative_path: String::new(),
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    files_done,
+                    files_total: 0,
+                    message,
+                },
+            );
         }
     };
 
-    emit(
+    emit_now(
+        &mut throttle,
         format!(
-            "Indexation des fichiers ({} exclusion(s))…",
+            "Inventaire rapide ({} exclusion(s))…",
             excludes.len()
         ),
         0,
@@ -399,28 +475,31 @@ async fn build_manifest(
             return Err(Error::Cancelled);
         }
         let path = fs::canonicalize(path).await.unwrap_or_else(|_| path.clone());
-        let meta = fs::metadata(&path).await?;
+        let meta = fs::metadata(&path).await.map_err(Error::from_io)?;
         if meta.is_file() {
             let name = path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".into());
-            emit(format!("Hash blake3 : {name}"), indexed);
-            let hash = hash_file(&path).await?;
             let size = meta.len();
             total_bytes += size;
             indexed += 1;
+            emit(
+                &mut throttle,
+                format!("Inventaire : {name}"),
+                indexed,
+            );
             files.push(FileEntry {
                 relative_path: name.clone(),
                 size,
-                hash,
+                hash: String::new(),
             });
             roots.push((name, path));
         } else if meta.is_dir() {
-            // If the selected root itself is an excluded name, skip entirely.
             if let Some(root_name) = path.file_name().and_then(|n| n.to_str()) {
                 if is_excluded_dir_name(root_name, excludes) {
-                    emit(
+                    emit_now(
+                        &mut throttle,
                         format!("Dossier exclu (racine) : {root_name}"),
                         indexed,
                     );
@@ -445,10 +524,6 @@ async fn build_manifest(
                 if cancel.load(Ordering::SeqCst) {
                     return Err(Error::Cancelled);
                 }
-                if entry.file_type().is_dir() {
-                    // Count skipped dirs via filter — only emit when we would have entered
-                    continue;
-                }
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -458,30 +533,36 @@ async fn build_manifest(
                     .unwrap_or(entry.path())
                     .to_string_lossy()
                     .replace('\\', "/");
-                // Safety: also skip if any path component is excluded
                 if rel
                     .split('/')
                     .any(|part| is_excluded_dir_name(part, excludes))
                 {
                     continue;
                 }
-                emit(format!("Hash blake3 : {rel}"), indexed);
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                let hash = hash_file(&abs).await?;
                 total_bytes += size;
                 indexed += 1;
+                emit(
+                    &mut throttle,
+                    format!("Inventaire : {rel}"),
+                    indexed,
+                );
                 files.push(FileEntry {
                     relative_path: rel.clone(),
                     size,
-                    hash,
+                    hash: String::new(),
                 });
                 roots.push((rel, abs));
             }
         }
     }
 
-    emit(
-        format!("Manifeste prêt ({indexed} fichier(s))."),
+    if let Some(tx) = progress {
+        throttle.flush(tx);
+    }
+    emit_now(
+        &mut throttle,
+        format!("Inventaire prêt ({indexed} fichier(s))."),
         indexed,
     );
 
@@ -494,27 +575,11 @@ async fn build_manifest(
     ))
 }
 
-async fn hash_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).await?;
-    let mut hasher = Hasher::new();
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn send_files<R, W>(
     writer: Arc<Mutex<W>>,
     reader: &mut R,
     roots: &RootMap,
     files: &[FileEntry],
-    concurrency: usize,
     cancel: Arc<AtomicBool>,
     progress: mpsc::UnboundedSender<ProgressEvent>,
     bytes_total: u64,
@@ -523,14 +588,12 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let files_total = files.len() as u64;
-    let bytes_done = Arc::new(Mutex::new(0u64));
-    let files_done = Arc::new(Mutex::new(0u64));
-    let mut handles = Vec::new();
+    let mut bytes_done = 0u64;
+    let mut files_done = 0u64;
+    let mut throttle = ProgressThrottle::new();
 
-    // Sequential send over one TCP stream is safer for framing; concurrency applies to
-    // hashing/prep. For v1 we stream files one-by-one but prep next file under semaphore.
+    // One TCP stream: send each file immediately while hashing (single read pass).
     for (rel, abs) in roots {
         if cancel.load(Ordering::SeqCst) {
             let mut w = writer.lock().await;
@@ -544,16 +607,18 @@ where
             .cloned()
             .ok_or_else(|| Error::Other(format!("missing manifest entry for {rel}")))?;
 
-        let _permit = sem.acquire().await.expect("semaphore");
-        let _ = progress.send(ProgressEvent {
-            kind: ProgressKind::FileStart,
-            relative_path: rel.clone(),
-            bytes_done: *bytes_done.lock().await,
-            bytes_total,
-            files_done: *files_done.lock().await,
-            files_total,
-            message: format!("Envoi de {rel}"),
-        });
+        throttle.send_now(
+            &progress,
+            ProgressEvent {
+                kind: ProgressKind::FileStart,
+                relative_path: rel.clone(),
+                bytes_done,
+                bytes_total,
+                files_done,
+                files_total,
+                message: format!("Envoi de {rel}"),
+            },
+        );
 
         {
             let mut w = writer.lock().await;
@@ -562,13 +627,19 @@ where
                 &Message::FileStart(FileStartPayload {
                     relative_path: entry.relative_path.clone(),
                     size: entry.size,
-                    hash: entry.hash.clone(),
+                    // Hash computed while streaming — filled in FileEnd.
+                    hash: String::new(),
                 }),
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                Error::Io(io) => Error::from_io(io),
+                other => other,
+            })?;
         }
 
-        let mut file = File::open(abs).await?;
+        let mut file = File::open(abs).await.map_err(Error::from_io)?;
+        let mut hasher = Hasher::new();
         let mut buf = vec![0u8; CHUNK_SIZE];
         let mut sent_for_file = 0u64;
         loop {
@@ -577,42 +648,57 @@ where
                 let _ = write_message(&mut *w, &Message::Cancel).await;
                 return Err(Error::Cancelled);
             }
-            let n = file.read(&mut buf).await?;
+            let n = file.read(&mut buf).await.map_err(Error::from_io)?;
             if n == 0 {
                 break;
             }
+            hasher.update(&buf[..n]);
             {
                 let mut w = writer.lock().await;
-                write_message(&mut *w, &Message::FileChunk(buf[..n].to_vec())).await?;
+                write_message(&mut *w, &Message::FileChunk(buf[..n].to_vec()))
+                    .await
+                    .map_err(|e| match e {
+                        Error::Io(io) => Error::from_io(io),
+                        other => other,
+                    })?;
             }
             sent_for_file += n as u64;
-            let mut bd = bytes_done.lock().await;
-            *bd += n as u64;
-            let _ = progress.send(ProgressEvent {
-                kind: ProgressKind::FileProgress,
-                relative_path: rel.clone(),
-                bytes_done: *bd,
-                bytes_total,
-                files_done: *files_done.lock().await,
-                files_total,
-                message: format!("{sent_for_file}/{}", entry.size),
-            });
+            bytes_done += n as u64;
+            throttle.send_throttled(
+                &progress,
+                ProgressEvent {
+                    kind: ProgressKind::FileProgress,
+                    relative_path: rel.clone(),
+                    bytes_done,
+                    bytes_total,
+                    files_done,
+                    files_total,
+                    message: format!("{sent_for_file}/{}", entry.size),
+                },
+            );
         }
 
+        let hash = hasher.finalize().to_hex().to_string();
         {
             let mut w = writer.lock().await;
             write_message(
                 &mut *w,
                 &Message::FileEnd(FileEndPayload {
                     relative_path: entry.relative_path.clone(),
-                    hash: entry.hash.clone(),
+                    hash,
                 }),
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                Error::Io(io) => Error::from_io(io),
+                other => other,
+            })?;
         }
 
-        // Wait ack
-        match read_message(reader).await? {
+        match read_message(reader).await.map_err(|e| match e {
+            Error::Io(io) => Error::from_io(io),
+            other => other,
+        })? {
             Message::Ack(ack) if ack.ok => {}
             Message::Ack(ack) => {
                 return Err(Error::Other(format!(
@@ -624,23 +710,22 @@ where
             other => return Err(Error::UnexpectedMessage(format!("{other:?}"))),
         }
 
-        {
-            let mut fd = files_done.lock().await;
-            *fd += 1;
-            let _ = progress.send(ProgressEvent {
+        files_done += 1;
+        throttle.send_now(
+            &progress,
+            ProgressEvent {
                 kind: ProgressKind::FileDone,
                 relative_path: rel.clone(),
-                bytes_done: *bytes_done.lock().await,
+                bytes_done,
                 bytes_total,
-                files_done: *fd,
+                files_done,
                 files_total,
                 message: format!("OK {rel}"),
-            });
-        }
-        drop(_permit);
-        handles.push(rel.clone());
+            },
+        );
     }
 
+    throttle.flush(&progress);
     let _ = progress.send(ProgressEvent {
         kind: ProgressKind::Complete,
         relative_path: String::new(),
@@ -666,9 +751,10 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    fs::create_dir_all(dest_dir).await?;
+    fs::create_dir_all(dest_dir).await.map_err(Error::from_io)?;
     let mut files_done = 0u64;
     let mut bytes_done = 0u64;
+    let mut throttle = ProgressThrottle::new();
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -681,51 +767,67 @@ where
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
+            Err(Error::Io(e)) => return Err(Error::from_io(e)),
             Err(e) => return Err(e),
         };
 
         match msg {
             Message::FileStart(start) => {
-                let _ = progress.send(ProgressEvent {
-                    kind: ProgressKind::FileStart,
-                    relative_path: start.relative_path.clone(),
-                    bytes_done,
-                    bytes_total,
-                    files_done,
-                    files_total,
-                    message: format!("Réception de {}", start.relative_path),
-                });
+                throttle.send_now(
+                    &progress,
+                    ProgressEvent {
+                        kind: ProgressKind::FileStart,
+                        relative_path: start.relative_path.clone(),
+                        bytes_done,
+                        bytes_total,
+                        files_done,
+                        files_total,
+                        message: format!("Réception de {}", start.relative_path),
+                    },
+                );
 
                 let dest_path = safe_join(dest_dir, &start.relative_path)?;
                 if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent).await?;
+                    fs::create_dir_all(parent).await.map_err(Error::from_io)?;
                 }
-                let mut out = File::create(&dest_path).await?;
+                let mut out = File::create(&dest_path).await.map_err(Error::from_io)?;
                 let mut hasher = Hasher::new();
                 let mut received = 0u64;
 
                 loop {
-                    match read_message(reader).await? {
+                    match read_message(reader).await.map_err(|e| match e {
+                        Error::Io(io) => Error::from_io(io),
+                        other => other,
+                    })? {
                         Message::FileChunk(chunk) => {
-                            out.write_all(&chunk).await?;
+                            out.write_all(&chunk).await.map_err(Error::from_io)?;
                             hasher.update(&chunk);
                             received += chunk.len() as u64;
                             bytes_done += chunk.len() as u64;
-                            let _ = progress.send(ProgressEvent {
-                                kind: ProgressKind::FileProgress,
-                                relative_path: start.relative_path.clone(),
-                                bytes_done,
-                                bytes_total,
-                                files_done,
-                                files_total,
-                                message: format!("{received}/{}", start.size),
-                            });
+                            throttle.send_throttled(
+                                &progress,
+                                ProgressEvent {
+                                    kind: ProgressKind::FileProgress,
+                                    relative_path: start.relative_path.clone(),
+                                    bytes_done,
+                                    bytes_total,
+                                    files_done,
+                                    files_total,
+                                    message: format!("{received}/{}", start.size),
+                                },
+                            );
                         }
                         Message::FileEnd(end) => {
-                            out.flush().await?;
+                            out.flush().await.map_err(Error::from_io)?;
                             drop(out);
                             let actual = hasher.finalize().to_hex().to_string();
-                            if actual != end.hash && actual != start.hash {
+                            // Prefer FileEnd hash (computed while streaming); start.hash may be empty.
+                            let expected = if !end.hash.is_empty() {
+                                end.hash.clone()
+                            } else {
+                                start.hash.clone()
+                            };
+                            if actual != expected {
                                 let _ = fs::remove_file(&dest_path).await;
                                 write_message(
                                     writer,
@@ -733,15 +835,14 @@ where
                                         relative_path: start.relative_path.clone(),
                                         ok: false,
                                         message: format!(
-                                            "hash mismatch expected {} got {actual}",
-                                            start.hash
+                                            "hash mismatch expected {expected} got {actual}"
                                         ),
                                     }),
                                 )
                                 .await?;
                                 return Err(Error::HashMismatch {
                                     path: start.relative_path,
-                                    expected: start.hash,
+                                    expected,
                                     actual,
                                 });
                             }
@@ -755,15 +856,18 @@ where
                             )
                             .await?;
                             files_done += 1;
-                            let _ = progress.send(ProgressEvent {
-                                kind: ProgressKind::FileDone,
-                                relative_path: start.relative_path.clone(),
-                                bytes_done,
-                                bytes_total,
-                                files_done,
-                                files_total,
-                                message: format!("OK {}", start.relative_path),
-                            });
+                            throttle.send_now(
+                                &progress,
+                                ProgressEvent {
+                                    kind: ProgressKind::FileDone,
+                                    relative_path: start.relative_path.clone(),
+                                    bytes_done,
+                                    bytes_total,
+                                    files_done,
+                                    files_total,
+                                    message: format!("OK {}", start.relative_path),
+                                },
+                            );
                             break;
                         }
                         Message::Cancel => return Err(Error::Cancelled),
@@ -780,7 +884,6 @@ where
             Message::Cancel => return Err(Error::Cancelled),
             Message::Error(e) => return Err(Error::Other(e.message)),
             other => {
-                // Ignore trailing noise
                 tracing::warn!("unexpected while receiving: {other:?}");
                 if files_done >= files_total {
                     break;
@@ -789,6 +892,7 @@ where
         }
     }
 
+    throttle.flush(&progress);
     let _ = progress.send(ProgressEvent {
         kind: ProgressKind::Complete,
         relative_path: String::new(),

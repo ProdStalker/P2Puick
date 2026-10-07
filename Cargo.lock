@@ -2613,6 +2613,7 @@ name = "p2puick-discovery"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "if-addrs",
  "mdns-sd",
  "serde",
  "thiserror 2.0.21",

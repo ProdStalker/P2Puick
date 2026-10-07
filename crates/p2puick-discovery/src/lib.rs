@@ -153,3 +153,20 @@ pub fn format_addr(host: &str, port: u16) -> String {
         format!("{host}:{port}")
     }
 }
+
+/// Non-loopback IPv4 addresses on local interfaces (for manual pairing).
+pub fn list_lan_ipv4() -> Vec<String> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut addrs: Vec<String> = ifaces
+        .into_iter()
+        .filter_map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4.ip.to_string()),
+            _ => None,
+        })
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}

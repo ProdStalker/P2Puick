@@ -46,7 +46,29 @@ impl Error {
             std::io::ErrorKind::TimedOut => {
                 Self::Other("Connexion expirée (timeout). Vérifie le Wi‑Fi et réessaie.".into())
             }
-            _ => Self::Io(err),
+            std::io::ErrorKind::ConnectionRefused => Self::Other(
+                "Connexion refusée. Sur l’hôte, clique d’abord « Attendre le pair & envoyer » (il doit écouter), puis rejoins depuis cet ordinateur."
+                    .into(),
+            ),
+            std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable => Self::Other(
+                "Hôte injoignable (pas de route). Même Wi‑Fi ? Saisis l’IP LAN affichée côté hôte (évite 169.254.x) et vérifie le pare-feu."
+                    .into(),
+            ),
+            _ => {
+                // macOS EHOSTUNREACH=65, Linux=113 — older Rust may not map the kind.
+                match err.raw_os_error() {
+                    Some(65) | Some(113) => Self::Other(
+                        "Hôte injoignable (pas de route). Même Wi‑Fi ? Saisis l’IP LAN affichée côté hôte (évite 169.254.x) et vérifie le pare-feu."
+                            .into(),
+                    ),
+                    Some(61) | Some(111) => Self::Other(
+                        "Connexion refusée. Sur l’hôte, clique d’abord « Attendre le pair & envoyer », puis rejoins."
+                            .into(),
+                    ),
+                    _ => Self::Io(err),
+                }
+            }
         }
     }
 }

@@ -19,6 +19,14 @@ pub struct AppInfo {
 pub struct HostStarted {
     pub pairing_code: String,
     pub port: u16,
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanInfo {
+    pub addresses: Vec<String>,
+    pub port: u16,
 }
 
 fn local_hostname() -> String {
@@ -77,7 +85,16 @@ pub async fn start_host(
     Ok(HostStarted {
         pairing_code: code,
         port,
+        addresses: p2puick_discovery::list_lan_ipv4(),
     })
+}
+
+#[tauri::command]
+pub fn lan_info(port: Option<u16>) -> LanInfo {
+    LanInfo {
+        addresses: p2puick_discovery::list_lan_ipv4(),
+        port: port.unwrap_or(p2puick_discovery::DEFAULT_PORT),
+    }
 }
 
 #[tauri::command]

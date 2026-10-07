@@ -37,6 +37,8 @@ export class AppComponent implements OnInit, OnDestroy {
   version = signal("");
   status = signal("Prêt");
   pairingCode = signal("");
+  hostPort = signal(47821);
+  lanAddresses = signal<string[]>([]);
   joinCode = "";
   manualHost = "";
   manualPort = 47821;
@@ -84,20 +86,34 @@ export class AppComponent implements OnInit, OnDestroy {
     this.unlistenStatus?.();
   }
 
-  goHome(): void {
+  async goHome(): Promise<void> {
+    await this.cancel();
+    try {
+      await invoke("stop_host");
+    } catch {
+      // ignore
+    }
     this.mode.set("home");
     this.error.set("");
+    this.progress.set(null);
+    this.busy.set(false);
   }
 
   async startHost(): Promise<void> {
     this.error.set("");
     this.busy.set(true);
     try {
-      const res = await invoke<{ pairingCode: string; port: number }>("start_host", {
+      const res = await invoke<{
+        pairingCode: string;
+        port: number;
+        addresses: string[];
+      }>("start_host", {
         pairingCode: null,
         port: null,
       });
       this.pairingCode.set(res.pairingCode);
+      this.hostPort.set(res.port);
+      this.lanAddresses.set(res.addresses ?? []);
       this.mode.set("host");
       this.status.set(`Hôte actif — code ${res.pairingCode}`);
     } catch (e) {
@@ -108,12 +124,16 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async stopHost(): Promise<void> {
+    await this.cancel();
     try {
       await invoke("stop_host");
     } catch {
       // ignore
     }
-    this.goHome();
+    this.mode.set("home");
+    this.error.set("");
+    this.progress.set(null);
+    this.busy.set(false);
   }
 
   goJoin(): void {

@@ -1,6 +1,6 @@
 <div class="shell">
   <header class="top">
-    <div class="brand" (click)="goHome()" role="button" tabindex="0">
+    <div class="brand" (click)="goHome()" (keyup.enter)="goHome()" role="button" tabindex="0">
       <img src="assets/p2puick-logo.png" alt="P2Puick" class="logo" />
       <div>
         <h1>P2Puick</h1>
@@ -38,6 +38,21 @@
       <div class="code-block">{{ pairingCode() }}</div>
       <p class="hint">Partage ce code avec le PC destination, puis sélectionne ce que tu veux envoyer.</p>
 
+      <div class="net-info" *ngIf="lanAddresses().length">
+        <p class="hint">
+          Pour une connexion manuelle, indique aussi ton IP et le port à l’autre PC&nbsp;:
+        </p>
+        <div class="list">
+          <div class="list-item" *ngFor="let ip of lanAddresses()">
+            <span class="mono">{{ ip }}</span>
+            <span class="muted">port {{ hostPort() }}</span>
+          </div>
+        </div>
+      </div>
+      <p class="hint" *ngIf="!lanAddresses().length">
+        Impossible de détecter l’IP locale — vérifie le réseau Wi‑Fi / Ethernet.
+      </p>
+
       <div class="list" *ngIf="selectedPaths().length">
         <div class="list-item" *ngFor="let path of selectedPaths()">{{ path }}</div>
       </div>
@@ -67,7 +82,7 @@
         <input [(ngModel)]="joinCode" maxlength="6" placeholder="123456" />
       </label>
       <label class="field">
-        <span>IP manuelle (optionnel)</span>
+        <span>IP de l’hôte (recommandé si la découverte échoue)</span>
         <input [(ngModel)]="manualHost" placeholder="192.168.1.20" />
       </label>
       <label class="field">

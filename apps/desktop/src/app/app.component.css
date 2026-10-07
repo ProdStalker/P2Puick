@@ -173,6 +173,30 @@ button:disabled {
   word-break: break-all;
 }
 
+.net-info {
+  margin-top: 16px;
+}
+
+.net-info .list-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 1rem;
+}
+
+.net-info .mono {
+  font-family: "Syne", ui-monospace, monospace;
+  letter-spacing: 0.04em;
+  color: var(--accent-2);
+}
+
+.net-info .muted {
+  color: var(--muted);
+  font-family: "DM Sans", sans-serif;
+  font-size: 0.9rem;
+}
+
 .progress {
   height: 12px;
   border-radius: 999px;

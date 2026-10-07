@@ -62,6 +62,9 @@ export class AppComponent implements OnInit, OnDestroy {
   retryQueue = signal<FailedEntry[]>([]);
   retryQueuePath = signal("");
 
+  /** Screen to restore when leaving Historique (must not kill an active transfer). */
+  private historyReturnMode: Mode = "home";
+
   private unlistenProgress?: UnlistenFn;
   private unlistenStatus?: UnlistenFn;
 
@@ -119,6 +122,12 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async goHome(): Promise<void> {
+    // Don't kill an in-flight transfer just because the user opened another screen.
+    if (this.busy()) {
+      this.mode.set("transfer");
+      this.status.set("Transfert toujours en cours…");
+      return;
+    }
     await this.cancel();
     try {
       await invoke("stop_host");
@@ -357,6 +366,9 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async openHistory(): Promise<void> {
+    if (this.mode() !== "history") {
+      this.historyReturnMode = this.mode();
+    }
     this.mode.set("history");
     try {
       const data = await fetchChangelog();
@@ -364,6 +376,15 @@ export class AppComponent implements OnInit, OnDestroy {
     } catch (e) {
       this.error.set(String(e));
       this.changelog.set([]);
+    }
+  }
+
+  /** Leave Historique without cancelling host/transfer. */
+  backFromHistory(): void {
+    const target = this.historyReturnMode;
+    this.mode.set(target);
+    if (target === "transfer" && this.busy()) {
+      this.status.set("Transfert toujours en cours…");
     }
   }
 

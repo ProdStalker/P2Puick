@@ -28,7 +28,8 @@ fi
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
 unset TAURI_SIGNING_PRIVATE_KEY_PATH
 
-npm run tauri build
+# App bundle only (skip DMG — updater needs .app.tar.gz + .sig).
+npx tauri build --bundles app
 
 # Collect updater artifacts produced by Tauri.
 # Cargo workspace → repo-root target/; fallback → src-tauri/target/.

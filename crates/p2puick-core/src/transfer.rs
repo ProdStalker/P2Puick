@@ -5,9 +5,11 @@ use crate::protocol::{
 };
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -87,8 +89,21 @@ impl TransferSession {
         source_paths: Vec<PathBuf>,
         progress: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
-        let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-        let (stream, peer) = listener.accept().await?;
+        let listener = bind_listener(port).await.map_err(|e| map_bind_error(e, port))?;
+        let _ = progress.send(ProgressEvent {
+            kind: ProgressKind::Connected,
+            relative_path: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
+            files_done: 0,
+            files_total: 0,
+            message: format!("En attente d’une connexion sur le port {port}…"),
+        });
+
+        let (stream, peer) = accept_one(&listener, &self.cancel).await?;
+        // Drop listener ASAP so the port is free for a later session.
+        drop(listener);
+
         tracing::info!("peer connected from {peer}");
         let _ = progress.send(ProgressEvent {
             kind: ProgressKind::Connected,
@@ -258,6 +273,38 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "P2Puick".into())
+}
+
+async fn bind_listener(port: u16) -> std::io::Result<TcpListener> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    TcpListener::bind(addr).await
+}
+
+fn map_bind_error(err: std::io::Error, port: u16) -> Error {
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        Error::Other(format!(
+            "Le port {port} est déjà utilisé. Ferme l’autre session P2Puick (ou quitte l’app) puis réessaie."
+        ))
+    } else {
+        Error::Io(err)
+    }
+}
+
+/// Accept one connection while honouring cancel (poll every 250ms so the listener can drop).
+async fn accept_one(
+    listener: &TcpListener,
+    cancel: &AtomicBool,
+) -> Result<(TcpStream, SocketAddr)> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+            Ok(Ok(pair)) => return Ok(pair),
+            Ok(Err(e)) => return Err(Error::Io(e)),
+            Err(_elapsed) => continue,
+        }
+    }
 }
 
 /// Map relative path → absolute source root file path.

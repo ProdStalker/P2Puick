@@ -2589,7 +2589,6 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 2.0.21",
  "tokio",
- "uuid",
 ]
 
 [[package]]

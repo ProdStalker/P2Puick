@@ -9,6 +9,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:try": "tauri build --bundles app --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'",
+    "test:rust": "cargo test --manifest-path ../../Cargo.toml -p p2puick-core -p p2puick-discovery",
     "update": "./scripts/release-update.sh",
     "publish:update": "./scripts/publish-update.sh",
     "publish:github": "./scripts/upload-github-release.sh"

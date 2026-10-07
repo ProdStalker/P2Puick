@@ -1,6 +1,6 @@
 [package]
 name = "p2puick"
-version = "0.1.5"
+version = "0.1.7"
 description = "P2Puick — LAN P2P file transfer"
 authors = ["ProdStalker"]
 edition = "2021"

@@ -4,10 +4,11 @@ use crate::protocol::{
     read_message, write_message, AckPayload, ErrorPayload, FileEndPayload, FileEntry,
     FileStartPayload, HelloPayload, Manifest, Message, CHUNK_SIZE,
 };
+use crate::retry_queue::{self, FailedEntry};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +45,8 @@ pub enum ProgressKind {
     FileStart,
     FileProgress,
     FileDone,
+    /// Single file failed but transfer may continue; queued for retry when configured.
+    FileFailed,
     Complete,
     Error,
     Cancelled,
@@ -56,6 +59,8 @@ pub struct SessionConfig {
     pub concurrency: usize,
     /// Directory names to skip while walking (e.g. `node_modules`).
     pub exclude_dir_names: Vec<String>,
+    /// Optional JSON file where failed/pending files are recorded for later retry.
+    pub retry_queue_path: Option<PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -65,6 +70,7 @@ impl Default for SessionConfig {
             hostname: hostname(),
             concurrency: DEFAULT_CONCURRENCY,
             exclude_dir_names: default_exclude_dir_names(),
+            retry_queue_path: None,
         }
     }
 }
@@ -106,7 +112,30 @@ impl TransferSession {
         let prep_task = tokio::spawn(async move {
             scan_inventory(&prep_paths, Some(&prep_progress), &prep_cancel, &excludes).await
         });
+        self.host_listen_and_send(port, config, prep_task, progress)
+            .await
+    }
 
+    /// Host: resend specific failed entries, preserving original relative paths.
+    pub async fn host_and_resend(
+        &self,
+        port: u16,
+        config: SessionConfig,
+        entries: Vec<FailedEntry>,
+        progress: mpsc::UnboundedSender<ProgressEvent>,
+    ) -> Result<()> {
+        let prep_task = tokio::spawn(async move { Ok(manifest_from_retry_entries(entries)) });
+        self.host_listen_and_send(port, config, prep_task, progress)
+            .await
+    }
+
+    async fn host_listen_and_send(
+        &self,
+        port: u16,
+        config: SessionConfig,
+        prep_task: tokio::task::JoinHandle<Result<(Manifest, RootMap)>>,
+        progress: mpsc::UnboundedSender<ProgressEvent>,
+    ) -> Result<()> {
         let listener = bind_listener(port).await.map_err(|e| map_bind_error(e, port))?;
         let _ = progress.send(ProgressEvent {
             kind: ProgressKind::Connected,
@@ -223,16 +252,56 @@ impl TransferSession {
             write_message(&mut *w, &Message::Manifest(manifest.clone())).await?;
         }
 
-        send_files(
+        let report = send_files(
             writer,
             &mut reader,
             &roots,
             &manifest.files,
             self.cancel.clone(),
-            progress,
+            progress.clone(),
             bytes_total,
         )
-        .await
+        .await;
+
+        persist_send_report(config.retry_queue_path.as_deref(), &report);
+
+        match report.fatal {
+            None if report.failed.is_empty() => Ok(()),
+            None => {
+                let _ = progress.send(ProgressEvent {
+                    kind: ProgressKind::Complete,
+                    relative_path: String::new(),
+                    bytes_done: bytes_total,
+                    bytes_total,
+                    files_done: report.sent.len() as u64,
+                    files_total,
+                    message: format!(
+                        "Terminé avec {} échec(s) enregistré(s) pour renvoi.",
+                        report.failed.len()
+                    ),
+                });
+                Ok(())
+            }
+            Some(err) => {
+                let _ = progress.send(ProgressEvent {
+                    kind: ProgressKind::Error,
+                    relative_path: String::new(),
+                    bytes_done: 0,
+                    bytes_total,
+                    files_done: report.sent.len() as u64,
+                    files_total,
+                    message: if report.failed.is_empty() {
+                        err.to_string()
+                    } else {
+                        format!(
+                            "{err} — {} fichier(s) en file de renvoi.",
+                            report.failed.len()
+                        )
+                    },
+                });
+                Err(err)
+            }
+        }
     }
 
     /// Join host, handshake as receiver, signal ready with dest dir, then receive.
@@ -415,6 +484,35 @@ async fn accept_one(
 /// Map relative path → absolute source root file path.
 type RootMap = Vec<(String, PathBuf)>;
 
+fn manifest_from_retry_entries(entries: Vec<FailedEntry>) -> (Manifest, RootMap) {
+    let mut files = Vec::new();
+    let mut roots = Vec::new();
+    let mut total_bytes = 0u64;
+    for entry in entries {
+        let abs = PathBuf::from(&entry.absolute_path);
+        let size = if entry.size > 0 {
+            entry.size
+        } else {
+            std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0)
+        };
+        total_bytes += size;
+        let rel = normalize_relative_path(&entry.relative_path);
+        files.push(FileEntry {
+            relative_path: rel.clone(),
+            size,
+            hash: String::new(),
+        });
+        roots.push((rel, abs));
+    }
+    (
+        Manifest {
+            files,
+            total_bytes,
+        },
+        roots,
+    )
+}
+
 /// Fast walk: collect paths + sizes only (no blake3). Hash happens during send.
 async fn scan_inventory(
     paths: &[PathBuf],
@@ -528,11 +626,14 @@ async fn scan_inventory(
                     continue;
                 }
                 let abs = entry.path().to_path_buf();
-                let rel = abs
-                    .strip_prefix(&base)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                // Never fall back to an absolute path — receivers reject those as unsafe.
+                let Some(rel_os) = abs.strip_prefix(&base).ok() else {
+                    continue;
+                };
+                let rel = normalize_relative_path(&rel_os.to_string_lossy());
+                if rel.is_empty() {
+                    continue;
+                }
                 if rel
                     .split('/')
                     .any(|part| is_excluded_dir_name(part, excludes))
@@ -575,6 +676,45 @@ async fn scan_inventory(
     ))
 }
 
+#[derive(Debug, Default)]
+struct SendReport {
+    sent: Vec<String>,
+    failed: Vec<FailedEntry>,
+    fatal: Option<Error>,
+}
+
+fn persist_send_report(queue_path: Option<&Path>, report: &SendReport) {
+    let Some(path) = queue_path else {
+        return;
+    };
+    if !report.sent.is_empty() {
+        let _ = retry_queue::mark_sent(path, &report.sent);
+    }
+    if !report.failed.is_empty() {
+        let _ = retry_queue::record_failures(path, report.failed.clone());
+    }
+}
+
+fn remaining_failures(
+    roots: &[(String, PathBuf)],
+    files: &[FileEntry],
+    from_index: usize,
+    reason: &str,
+) -> Vec<FailedEntry> {
+    roots
+        .iter()
+        .skip(from_index)
+        .map(|(rel, abs)| {
+            let size = files
+                .iter()
+                .find(|f| &f.relative_path == rel)
+                .map(|f| f.size)
+                .unwrap_or(0);
+            retry_queue::failed_entry(rel.clone(), abs.clone(), size, reason)
+        })
+        .collect()
+}
+
 async fn send_files<R, W>(
     writer: Arc<Mutex<W>>,
     reader: &mut R,
@@ -583,7 +723,7 @@ async fn send_files<R, W>(
     cancel: Arc<AtomicBool>,
     progress: mpsc::UnboundedSender<ProgressEvent>,
     bytes_total: u64,
-) -> Result<()>
+) -> SendReport
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -592,20 +732,34 @@ where
     let mut bytes_done = 0u64;
     let mut files_done = 0u64;
     let mut throttle = ProgressThrottle::new();
+    let mut report = SendReport::default();
 
-    // One TCP stream: send each file immediately while hashing (single read pass).
-    for (rel, abs) in roots {
+    for (idx, (rel, abs)) in roots.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             let mut w = writer.lock().await;
             let _ = write_message(&mut *w, &Message::Cancel).await;
-            return Err(Error::Cancelled);
+            report.failed.extend(remaining_failures(
+                roots,
+                files,
+                idx,
+                "transfert annulé — fichier non envoyé",
+            ));
+            report.fatal = Some(Error::Cancelled);
+            return report;
         }
 
-        let entry = files
-            .iter()
-            .find(|f| &f.relative_path == rel)
-            .cloned()
-            .ok_or_else(|| Error::Other(format!("missing manifest entry for {rel}")))?;
+        let entry = match files.iter().find(|f| &f.relative_path == rel).cloned() {
+            Some(e) => e,
+            None => {
+                report.failed.push(retry_queue::failed_entry(
+                    rel.clone(),
+                    abs.clone(),
+                    0,
+                    "entrée manifeste manquante",
+                ));
+                continue;
+            }
+        };
 
         throttle.send_now(
             &progress,
@@ -620,122 +774,173 @@ where
             },
         );
 
-        {
-            let mut w = writer.lock().await;
-            write_message(
-                &mut *w,
-                &Message::FileStart(FileStartPayload {
-                    relative_path: entry.relative_path.clone(),
-                    size: entry.size,
-                    // Hash computed while streaming — filled in FileEnd.
-                    hash: String::new(),
-                }),
-            )
-            .await
-            .map_err(|e| match e {
-                Error::Io(io) => Error::from_io(io),
-                other => other,
-            })?;
-        }
-
-        let mut file = File::open(abs).await.map_err(Error::from_io)?;
-        let mut hasher = Hasher::new();
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut sent_for_file = 0u64;
-        loop {
-            if cancel.load(Ordering::SeqCst) {
-                let mut w = writer.lock().await;
-                let _ = write_message(&mut *w, &Message::Cancel).await;
-                return Err(Error::Cancelled);
-            }
-            let n = file.read(&mut buf).await.map_err(Error::from_io)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
+        let send_one = async {
             {
                 let mut w = writer.lock().await;
-                write_message(&mut *w, &Message::FileChunk(buf[..n].to_vec()))
-                    .await
-                    .map_err(|e| match e {
-                        Error::Io(io) => Error::from_io(io),
-                        other => other,
-                    })?;
+                write_message(
+                    &mut *w,
+                    &Message::FileStart(FileStartPayload {
+                        relative_path: entry.relative_path.clone(),
+                        size: entry.size,
+                        hash: String::new(),
+                    }),
+                )
+                .await
+                .map_err(|e| match e {
+                    Error::Io(io) => Error::from_io(io),
+                    other => other,
+                })?;
             }
-            sent_for_file += n as u64;
-            bytes_done += n as u64;
-            throttle.send_throttled(
-                &progress,
-                ProgressEvent {
-                    kind: ProgressKind::FileProgress,
-                    relative_path: rel.clone(),
-                    bytes_done,
-                    bytes_total,
-                    files_done,
-                    files_total,
-                    message: format!("{sent_for_file}/{}", entry.size),
-                },
-            );
-        }
 
-        let hash = hasher.finalize().to_hex().to_string();
-        {
-            let mut w = writer.lock().await;
-            write_message(
-                &mut *w,
-                &Message::FileEnd(FileEndPayload {
-                    relative_path: entry.relative_path.clone(),
-                    hash,
-                }),
-            )
-            .await
-            .map_err(|e| match e {
+            let mut file = File::open(abs).await.map_err(Error::from_io)?;
+            let mut hasher = Hasher::new();
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut sent_for_file = 0u64;
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    let mut w = writer.lock().await;
+                    let _ = write_message(&mut *w, &Message::Cancel).await;
+                    return Err(Error::Cancelled);
+                }
+                let n = file.read(&mut buf).await.map_err(Error::from_io)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                {
+                    let mut w = writer.lock().await;
+                    write_message(&mut *w, &Message::FileChunk(buf[..n].to_vec()))
+                        .await
+                        .map_err(|e| match e {
+                            Error::Io(io) => Error::from_io(io),
+                            other => other,
+                        })?;
+                }
+                sent_for_file += n as u64;
+                bytes_done += n as u64;
+                throttle.send_throttled(
+                    &progress,
+                    ProgressEvent {
+                        kind: ProgressKind::FileProgress,
+                        relative_path: rel.clone(),
+                        bytes_done,
+                        bytes_total,
+                        files_done,
+                        files_total,
+                        message: format!("{sent_for_file}/{}", entry.size),
+                    },
+                );
+            }
+
+            let hash = hasher.finalize().to_hex().to_string();
+            {
+                let mut w = writer.lock().await;
+                write_message(
+                    &mut *w,
+                    &Message::FileEnd(FileEndPayload {
+                        relative_path: entry.relative_path.clone(),
+                        hash,
+                    }),
+                )
+                .await
+                .map_err(|e| match e {
+                    Error::Io(io) => Error::from_io(io),
+                    other => other,
+                })?;
+            }
+
+            match read_message(reader).await.map_err(|e| match e {
                 Error::Io(io) => Error::from_io(io),
                 other => other,
-            })?;
-        }
-
-        match read_message(reader).await.map_err(|e| match e {
-            Error::Io(io) => Error::from_io(io),
-            other => other,
-        })? {
-            Message::Ack(ack) if ack.ok => {}
-            Message::Ack(ack) => {
-                return Err(Error::Other(format!(
+            })? {
+                Message::Ack(ack) if ack.ok => Ok(()),
+                Message::Ack(ack) => Err(Error::Other(format!(
                     "receiver rejected {}: {}",
                     ack.relative_path, ack.message
-                )));
+                ))),
+                Message::Cancel => Err(Error::Cancelled),
+                other => Err(Error::UnexpectedMessage(format!("{other:?}"))),
             }
-            Message::Cancel => return Err(Error::Cancelled),
-            other => return Err(Error::UnexpectedMessage(format!("{other:?}"))),
-        }
+        };
 
-        files_done += 1;
-        throttle.send_now(
-            &progress,
-            ProgressEvent {
-                kind: ProgressKind::FileDone,
-                relative_path: rel.clone(),
-                bytes_done,
-                bytes_total,
-                files_done,
-                files_total,
-                message: format!("OK {rel}"),
-            },
-        );
+        match send_one.await {
+            Ok(()) => {
+                report.sent.push(abs.to_string_lossy().into_owned());
+                files_done += 1;
+                throttle.send_now(
+                    &progress,
+                    ProgressEvent {
+                        kind: ProgressKind::FileDone,
+                        relative_path: rel.clone(),
+                        bytes_done,
+                        bytes_total,
+                        files_done,
+                        files_total,
+                        message: format!("OK {rel}"),
+                    },
+                );
+            }
+            Err(Error::Cancelled) => {
+                report.failed.extend(remaining_failures(
+                    roots,
+                    files,
+                    idx,
+                    "transfert annulé — fichier non envoyé",
+                ));
+                report.fatal = Some(Error::Cancelled);
+                return report;
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let is_reject = matches!(&e, Error::Other(msg) if msg.contains("receiver rejected"));
+                report.failed.push(retry_queue::failed_entry(
+                    rel.clone(),
+                    abs.clone(),
+                    entry.size,
+                    reason.clone(),
+                ));
+                if is_reject {
+                    // Per-file reject: keep going so the peer can receive the rest.
+                    throttle.send_now(
+                        &progress,
+                        ProgressEvent {
+                            kind: ProgressKind::FileFailed,
+                            relative_path: rel.clone(),
+                            bytes_done,
+                            bytes_total,
+                            files_done,
+                            files_total,
+                            message: format!("Échec {rel} (en file de renvoi) : {reason}"),
+                        },
+                    );
+                    continue;
+                }
+                // Connection / IO fatal: queue current + remaining.
+                report.failed.extend(remaining_failures(
+                    roots,
+                    files,
+                    idx + 1,
+                    "non envoyé (transfert interrompu)",
+                ));
+                report.fatal = Some(e);
+                return report;
+            }
+        }
     }
 
     throttle.flush(&progress);
-    let _ = progress.send(ProgressEvent {
-        kind: ProgressKind::Complete,
-        relative_path: String::new(),
-        bytes_done: bytes_total,
-        bytes_total,
-        files_done: files_total,
-        files_total,
-        message: "Transfert terminé".into(),
-    });
-    Ok(())
+    if report.failed.is_empty() {
+        let _ = progress.send(ProgressEvent {
+            kind: ProgressKind::Complete,
+            relative_path: String::new(),
+            bytes_done: bytes_total,
+            bytes_total,
+            files_done: files_total,
+            files_total,
+            message: "Transfert terminé".into(),
+        });
+    }
+    report
 }
 
 async fn receive_files<R, W>(
@@ -786,13 +991,110 @@ where
                     },
                 );
 
-                let dest_path = safe_join(dest_dir, &start.relative_path)?;
+                let dest_path = match safe_join(dest_dir, &start.relative_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let reason = e.to_string();
+                        let _ = drain_until_file_end(reader).await;
+                        let _ = write_message(
+                            writer,
+                            &Message::Ack(AckPayload {
+                                relative_path: start.relative_path.clone(),
+                                ok: false,
+                                message: reason.clone(),
+                            }),
+                        )
+                        .await;
+                        throttle.send_now(
+                            &progress,
+                            ProgressEvent {
+                                kind: ProgressKind::FileFailed,
+                                relative_path: start.relative_path.clone(),
+                                bytes_done,
+                                bytes_total,
+                                files_done,
+                                files_total,
+                                message: format!(
+                                    "Échec {}: {reason} (hôte peut renvoyer plus tard)",
+                                    start.relative_path
+                                ),
+                            },
+                        );
+                        files_done += 1;
+                        if files_done >= files_total {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent).await.map_err(Error::from_io)?;
+                    if let Err(e) = fs::create_dir_all(parent).await {
+                        let reason = Error::from_io(e).to_string();
+                        let _ = drain_until_file_end(reader).await;
+                        let _ = write_message(
+                            writer,
+                            &Message::Ack(AckPayload {
+                                relative_path: start.relative_path.clone(),
+                                ok: false,
+                                message: reason.clone(),
+                            }),
+                        )
+                        .await;
+                        throttle.send_now(
+                            &progress,
+                            ProgressEvent {
+                                kind: ProgressKind::FileFailed,
+                                relative_path: start.relative_path.clone(),
+                                bytes_done,
+                                bytes_total,
+                                files_done,
+                                files_total,
+                                message: format!("Échec {}: {reason}", start.relative_path),
+                            },
+                        );
+                        files_done += 1;
+                        if files_done >= files_total {
+                            break;
+                        }
+                        continue;
+                    }
                 }
-                let mut out = File::create(&dest_path).await.map_err(Error::from_io)?;
+                let mut out = match File::create(&dest_path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let reason = Error::from_io(e).to_string();
+                        let _ = drain_until_file_end(reader).await;
+                        let _ = write_message(
+                            writer,
+                            &Message::Ack(AckPayload {
+                                relative_path: start.relative_path.clone(),
+                                ok: false,
+                                message: reason.clone(),
+                            }),
+                        )
+                        .await;
+                        throttle.send_now(
+                            &progress,
+                            ProgressEvent {
+                                kind: ProgressKind::FileFailed,
+                                relative_path: start.relative_path.clone(),
+                                bytes_done,
+                                bytes_total,
+                                files_done,
+                                files_total,
+                                message: format!("Échec {}: {reason}", start.relative_path),
+                            },
+                        );
+                        files_done += 1;
+                        if files_done >= files_total {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let mut hasher = Hasher::new();
                 let mut received = 0u64;
+                let mut file_failed = false;
 
                 loop {
                     match read_message(reader).await.map_err(|e| match e {
@@ -800,7 +1102,38 @@ where
                         other => other,
                     })? {
                         Message::FileChunk(chunk) => {
-                            out.write_all(&chunk).await.map_err(Error::from_io)?;
+                            if let Err(e) = out.write_all(&chunk).await {
+                                file_failed = true;
+                                let reason = Error::from_io(e).to_string();
+                                drop(out);
+                                let _ = fs::remove_file(&dest_path).await;
+                                let _ = drain_until_file_end(reader).await;
+                                let _ = write_message(
+                                    writer,
+                                    &Message::Ack(AckPayload {
+                                        relative_path: start.relative_path.clone(),
+                                        ok: false,
+                                        message: reason.clone(),
+                                    }),
+                                )
+                                .await;
+                                throttle.send_now(
+                                    &progress,
+                                    ProgressEvent {
+                                        kind: ProgressKind::FileFailed,
+                                        relative_path: start.relative_path.clone(),
+                                        bytes_done,
+                                        bytes_total,
+                                        files_done,
+                                        files_total,
+                                        message: format!(
+                                            "Échec {}: {reason}",
+                                            start.relative_path
+                                        ),
+                                    },
+                                );
+                                break;
+                            }
                             hasher.update(&chunk);
                             received += chunk.len() as u64;
                             bytes_done += chunk.len() as u64;
@@ -818,10 +1151,12 @@ where
                             );
                         }
                         Message::FileEnd(end) => {
+                            if file_failed {
+                                break;
+                            }
                             out.flush().await.map_err(Error::from_io)?;
                             drop(out);
                             let actual = hasher.finalize().to_hex().to_string();
-                            // Prefer FileEnd hash (computed while streaming); start.hash may be empty.
                             let expected = if !end.hash.is_empty() {
                                 end.hash.clone()
                             } else {
@@ -840,11 +1175,23 @@ where
                                     }),
                                 )
                                 .await?;
-                                return Err(Error::HashMismatch {
-                                    path: start.relative_path,
-                                    expected,
-                                    actual,
-                                });
+                                files_done += 1;
+                                throttle.send_now(
+                                    &progress,
+                                    ProgressEvent {
+                                        kind: ProgressKind::FileFailed,
+                                        relative_path: start.relative_path.clone(),
+                                        bytes_done,
+                                        bytes_total,
+                                        files_done,
+                                        files_total,
+                                        message: format!(
+                                            "Hash incorrect pour {} (hôte peut renvoyer)",
+                                            start.relative_path
+                                        ),
+                                    },
+                                );
+                                break;
                             }
                             write_message(
                                 writer,
@@ -877,6 +1224,10 @@ where
                     }
                 }
 
+                if file_failed {
+                    files_done += 1;
+                }
+
                 if files_done >= files_total {
                     break;
                 }
@@ -905,11 +1256,126 @@ where
     Ok(())
 }
 
+/// Discard chunks until FileEnd after a per-file setup failure.
+async fn drain_until_file_end<R>(reader: &mut R) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        match read_message(reader).await.map_err(|e| match e {
+            Error::Io(io) => Error::from_io(io),
+            other => other,
+        })? {
+            Message::FileChunk(_) => continue,
+            Message::FileEnd(_) => return Ok(()),
+            Message::Cancel => return Err(Error::Cancelled),
+            other => return Err(Error::UnexpectedMessage(format!("{other:?}"))),
+        }
+    }
+}
+
+/// Normalize wire paths to `/`-separated relative form (no drive/root prefix).
+fn normalize_relative_path(relative: &str) -> String {
+    let normalized = relative.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        // Skip Windows drive-like prefixes left over from absolute fallbacks ("C:", "D:").
+        if part.len() == 2 && part.as_bytes()[1] == b':' {
+            continue;
+        }
+        parts.push(part.to_string());
+    }
+    parts.join("/")
+}
+
 fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
-    let rel = Path::new(relative);
-    if rel.is_absolute() || relative.contains("..") {
+    let cleaned = normalize_relative_path(relative);
+    if cleaned.is_empty() {
         return Err(Error::protocol(format!("unsafe path: {relative}")));
     }
-    Ok(base.join(rel))
+
+    let mut out = PathBuf::new();
+    for component in Path::new(&cleaned).components() {
+        match component {
+            Component::Normal(part) => {
+                let s = part.to_string_lossy();
+                if s.contains('\0') || s == ".." {
+                    return Err(Error::protocol(format!("unsafe path: {relative}")));
+                }
+                out.push(part);
+            }
+            Component::CurDir => {}
+            // ParentDir / RootDir / Prefix must never appear after normalize.
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::protocol(format!("unsafe path: {relative}")));
+            }
+        }
+    }
+
+    if out.as_os_str().is_empty() {
+        return Err(Error::protocol(format!("unsafe path: {relative}")));
+    }
+
+    // Reject any remaining `..` segment (substring check was too loose / too brittle).
+    if out
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(Error::protocol(format!("unsafe path: {relative}")));
+    }
+
+    Ok(base.join(out))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{normalize_relative_path, safe_join};
+    use std::path::Path;
+
+    #[test]
+    fn accepts_nested_project_asset_path() {
+        let dest = Path::new("/tmp/p2puick-dest");
+        let joined = safe_join(
+            dest,
+            "golden-flute-classic/assets/images/logos/region_nyon.png",
+        )
+        .unwrap();
+        assert_eq!(
+            joined,
+            dest.join("golden-flute-classic/assets/images/logos/region_nyon.png")
+        );
+    }
+
+    #[test]
+    fn accepts_leading_slash_as_relative() {
+        let dest = Path::new("/tmp/p2puick-dest");
+        let joined = safe_join(dest, "/assets/images/logo.png").unwrap();
+        assert_eq!(joined, dest.join("assets/images/logo.png"));
+    }
+
+    #[test]
+    fn accepts_windows_separators() {
+        let dest = Path::new("/tmp/p2puick-dest");
+        let joined = safe_join(dest, r"assets\images\logo.png").unwrap();
+        assert_eq!(joined, dest.join("assets/images/logo.png"));
+    }
+
+    #[test]
+    fn rejects_parent_dir_segments() {
+        let dest = Path::new("/tmp/p2puick-dest");
+        assert!(safe_join(dest, "assets/../../../etc/passwd").is_err());
+        assert!(safe_join(dest, "assets/foo/../../secret").is_err());
+    }
+
+    #[test]
+    fn normalize_strips_drive_prefix() {
+        assert_eq!(
+            normalize_relative_path(r"C:\project\assets\logo.png"),
+            "project/assets/logo.png"
+        );
+    }
 }
 

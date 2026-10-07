@@ -144,17 +144,28 @@ button:disabled {
   font-size: 0.88rem;
 }
 
-.field input {
+.field input,
+.field textarea {
   background: rgba(0, 0, 0, 0.25);
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 12px 14px;
   color: var(--text);
   outline: none;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
-.field input:focus {
+.field input:focus,
+.field textarea:focus {
   border-color: var(--accent);
+}
+
+.hint code {
+  color: var(--accent-2);
+  font-size: 0.9em;
 }
 
 .list {
@@ -202,7 +213,7 @@ button:disabled {
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.28);
   overflow: hidden;
-  margin: 18px 0 10px;
+  margin: 18px 0 14px;
 }
 
 .bar {
@@ -216,9 +227,52 @@ button:disabled {
   font-size: 0.9rem;
 }
 
+.progress-msg {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 0 0 14px;
+  min-height: 2.8em;
+}
+
+.progress-pct {
+  flex: 0 0 auto;
+  font-weight: 700;
+  color: var(--accent-2);
+}
+
+.progress-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+  line-height: 1.35;
+}
+
+.progress-meta {
+  margin: 0 0 18px;
+  min-height: 1.4em;
+}
+
+.list-clear {
+  justify-self: start;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+}
+
 .status-line {
   color: var(--accent-2);
-  margin: 0 0 12px;
+  margin: 0 0 16px;
+  min-height: 2.6em;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
 }
 
 .error {

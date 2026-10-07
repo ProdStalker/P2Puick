@@ -1,0 +1,24 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+
+# Tauri
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/updater.key
+apps/desktop/src-tauri/WixTools/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local release artifacts
+apps/desktop/updates/latest.json
+!apps/desktop/updates/.gitkeep

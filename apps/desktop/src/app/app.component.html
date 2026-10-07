@@ -90,6 +90,43 @@
       <p class="hint">
         Clique sur envoyer <strong>avant</strong> que l’autre PC rejoigne : l’hôte écoute alors la connexion.
       </p>
+
+      <div class="retry-box" *ngIf="retryQueue().length">
+        <h3>À renvoyer ({{ retryQueue().length }})</h3>
+        <p class="hint">
+          Fichiers en échec enregistrés pour un renvoi ciblé
+          <span class="mono" *ngIf="retryQueuePath()" [title]="retryQueuePath()">· liste locale</span>
+        </p>
+        <div class="list retry-list">
+          <div class="list-item retry-item" *ngFor="let item of retryQueue()">
+            <div class="retry-meta">
+              <span class="mono">{{ item.relativePath }}</span>
+              <span class="muted">{{ item.error }}</span>
+            </div>
+            <button
+              type="button"
+              class="ghost"
+              [disabled]="busy()"
+              (click)="removeRetryEntry(item.absolutePath)"
+            >
+              Retirer
+            </button>
+          </div>
+        </div>
+        <div class="cta-row">
+          <button
+            type="button"
+            class="primary"
+            [disabled]="busy()"
+            (click)="launchRetrySend()"
+          >
+            Renvoyer les échecs
+          </button>
+          <button type="button" class="ghost" [disabled]="busy()" (click)="clearRetryQueue()">
+            Vider la liste
+          </button>
+        </div>
+      </div>
     </section>
 
     <section *ngIf="mode() === 'join'" class="panel">

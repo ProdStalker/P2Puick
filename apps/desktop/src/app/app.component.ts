@@ -26,6 +26,14 @@ type ProgressEvent = {
   message: string;
 };
 
+type FailedEntry = {
+  relativePath: string;
+  absolutePath: string;
+  size: number;
+  error: string;
+  failedAtUnix: number;
+};
+
 @Component({
   selector: "app-root",
   imports: [CommonModule, FormsModule],
@@ -51,6 +59,8 @@ export class AppComponent implements OnInit, OnDestroy {
   busy = signal(false);
   error = signal("");
   changelog = signal<ChangelogEntry[]>([]);
+  retryQueue = signal<FailedEntry[]>([]);
+  retryQueuePath = signal("");
 
   private unlistenProgress?: UnlistenFn;
   private unlistenStatus?: UnlistenFn;
@@ -63,16 +73,22 @@ export class AppComponent implements OnInit, OnDestroy {
     } catch {
       this.excludeText = "node_modules\nvendor\nvar\n.git\ntarget\ndist";
     }
+    await this.refreshRetryQueue();
     void checkOnStartup();
     this.unlistenProgress = await listen<ProgressEvent>("transfer-progress", (event) => {
       this.progress.set(event.payload);
       this.status.set(event.payload.message || event.payload.kind);
       if (event.payload.kind === "complete") {
         this.busy.set(false);
+        void this.refreshRetryQueue();
+      }
+      if (event.payload.kind === "fileFailed") {
+        void this.refreshRetryQueue();
       }
       if (event.payload.kind === "error" || event.payload.kind === "cancelled") {
         this.busy.set(false);
         this.error.set(event.payload.message);
+        void this.refreshRetryQueue();
       }
     });
     this.unlistenStatus = await listen<Record<string, unknown>>("session-status", (event) => {
@@ -191,6 +207,35 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
+  async refreshRetryQueue(): Promise<void> {
+    try {
+      const entries = await invoke<FailedEntry[]>("list_retry_queue");
+      this.retryQueue.set(entries ?? []);
+      const path = await invoke<string>("retry_queue_file_path");
+      this.retryQueuePath.set(path ?? "");
+    } catch {
+      this.retryQueue.set([]);
+    }
+  }
+
+  async clearRetryQueue(): Promise<void> {
+    try {
+      await invoke("clear_retry_queue");
+      await this.refreshRetryQueue();
+    } catch (e) {
+      this.error.set(String(e));
+    }
+  }
+
+  async removeRetryEntry(absolutePath: string): Promise<void> {
+    try {
+      await invoke("remove_retry_entry", { absolutePath });
+      await this.refreshRetryQueue();
+    } catch (e) {
+      this.error.set(String(e));
+    }
+  }
+
   async launchSend(): Promise<void> {
     if (!this.selectedPaths().length) {
       this.error.set("Sélectionne au moins un fichier ou dossier.");
@@ -214,6 +259,27 @@ export class AppComponent implements OnInit, OnDestroy {
       this.error.set(String(e));
     } finally {
       this.busy.set(false);
+      await this.refreshRetryQueue();
+    }
+  }
+
+  async launchRetrySend(): Promise<void> {
+    if (!this.retryQueue().length) {
+      this.error.set("Aucun fichier en échec à renvoyer.");
+      return;
+    }
+    this.error.set("");
+    this.busy.set(true);
+    this.mode.set("transfer");
+    this.status.set("Renvoi des fichiers en échec — l’autre PC doit rejoindre la session.");
+    try {
+      await invoke("begin_send_retry");
+      this.status.set("Renvoi terminé");
+    } catch (e) {
+      this.error.set(String(e));
+    } finally {
+      this.busy.set(false);
+      await this.refreshRetryQueue();
     }
   }
 

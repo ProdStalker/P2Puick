@@ -208,6 +208,44 @@ button:disabled {
   font-size: 0.9rem;
 }
 
+.retry-box {
+  margin-top: 28px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.retry-box h3 {
+  font-family: "Syne", sans-serif;
+  font-size: 1.15rem;
+  margin: 0 0 6px;
+}
+
+.retry-list {
+  max-height: 220px;
+  overflow: auto;
+}
+
+.retry-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.retry-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.retry-meta .muted {
+  color: var(--muted);
+  font-family: "DM Sans", sans-serif;
+  font-size: 0.78rem;
+  word-break: break-word;
+}
+
 .progress {
   height: 12px;
   border-radius: 999px;

@@ -1,7 +1,7 @@
 use crate::state::{AppState, Role};
 use p2puick_core::{
-    default_exclude_dir_names, generate_pairing_code, ProgressEvent, SessionConfig,
-    TransferSession,
+    default_exclude_dir_names, generate_pairing_code, FailedEntry, ProgressEvent, RetryQueue,
+    SessionConfig, TransferSession,
 };
 use p2puick_discovery::{self, Advertisement, DiscoveredPeer};
 use serde::Serialize;
@@ -9,6 +9,21 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+
+fn retry_queue_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app data dir: {e}"))?;
+    Ok(dir.join("retry-queue.json"))
+}
+
+fn session_with_retry(app: &AppHandle, mut config: SessionConfig) -> SessionConfig {
+    if let Ok(path) = retry_queue_path(app) {
+        config.retry_queue_path = Some(path);
+    }
+    config
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,12 +253,16 @@ pub async fn begin_send(
     let result = session
         .host_and_send(
             port,
-            SessionConfig {
-                pairing_code: code,
-                hostname: local_hostname(),
-                concurrency: p2puick_core::DEFAULT_CONCURRENCY,
-                exclude_dir_names: excludes,
-            },
+            session_with_retry(
+                &app,
+                SessionConfig {
+                    pairing_code: code,
+                    hostname: local_hostname(),
+                    concurrency: p2puick_core::DEFAULT_CONCURRENCY,
+                    exclude_dir_names: excludes,
+                    retry_queue_path: None,
+                },
+            ),
             source_paths,
             tx,
         )
@@ -315,6 +334,7 @@ pub async fn begin_receive(
                 hostname: local_hostname(),
                 concurrency: p2puick_core::DEFAULT_CONCURRENCY,
                 exclude_dir_names: vec![],
+                retry_queue_path: None,
             },
             PathBuf::from(dest_dir),
             tx,
@@ -349,4 +369,129 @@ pub fn cancel_transfer(state: State<'_, AppState>) -> Result<(), String> {
         session.cancel();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn list_retry_queue(app: AppHandle) -> Result<Vec<FailedEntry>, String> {
+    let path = retry_queue_path(&app)?;
+    Ok(RetryQueue::load(&path).entries)
+}
+
+#[tauri::command]
+pub fn clear_retry_queue(app: AppHandle) -> Result<(), String> {
+    let path = retry_queue_path(&app)?;
+    let mut queue = RetryQueue::load(&path);
+    queue.clear();
+    queue.save(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn remove_retry_entry(app: AppHandle, absolute_path: String) -> Result<(), String> {
+    let path = retry_queue_path(&app)?;
+    let mut queue = RetryQueue::load(&path);
+    queue.remove_absolutes(&[absolute_path]);
+    queue.save(&path).map_err(|e| e.to_string())
+}
+
+/// Resend only files recorded in the persistent retry queue (preserves relative paths).
+#[tauri::command]
+pub async fn begin_send_retry(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let queue_path = retry_queue_path(&app)?;
+    let queue = RetryQueue::load(&queue_path);
+    if queue.is_empty() {
+        return Err("Aucun fichier en échec à renvoyer.".into());
+    }
+
+    let mut missing = Vec::new();
+    let mut entries = Vec::new();
+    for entry in queue.entries {
+        let p = PathBuf::from(&entry.absolute_path);
+        if p.is_file() {
+            entries.push(entry);
+        } else {
+            missing.push(entry.absolute_path);
+        }
+    }
+    if !missing.is_empty() {
+        let mut fresh = RetryQueue::load(&queue_path);
+        fresh.remove_absolutes(&missing);
+        let _ = fresh.save(&queue_path);
+    }
+    if entries.is_empty() {
+        return Err("Les fichiers en échec sont introuvables sur le disque.".into());
+    }
+
+    let (code, port, session) = {
+        let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
+        if inner.role != Some(Role::Host) {
+            return Err("Démarre d’abord une session hôte".into());
+        }
+        if inner.host_task_running {
+            return Err("Transfert déjà en cours".into());
+        }
+        let code = inner
+            .pairing_code
+            .clone()
+            .ok_or_else(|| "Code de pairing manquant".to_string())?;
+        let port = inner.listen_port;
+        inner.host_task_running = true;
+        let session = TransferSession::new();
+        inner.transfer = Some(session.clone());
+        (code, port, session)
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
+    let progress_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let _ = progress_app.emit("transfer-progress", ev);
+        }
+    });
+
+    let result = session
+        .host_and_resend(
+            port,
+            session_with_retry(
+                &app,
+                SessionConfig {
+                    pairing_code: code,
+                    hostname: local_hostname(),
+                    concurrency: p2puick_core::DEFAULT_CONCURRENCY,
+                    exclude_dir_names: vec![],
+                    retry_queue_path: None,
+                },
+            ),
+            entries,
+            tx,
+        )
+        .await;
+
+    if let Ok(mut inner) = app.state::<AppState>().inner.lock() {
+        inner.host_task_running = false;
+    }
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = app.emit(
+                "transfer-progress",
+                ProgressEvent {
+                    kind: p2puick_core::ProgressKind::Error,
+                    relative_path: String::new(),
+                    bytes_done: 0,
+                    bytes_total: 0,
+                    files_done: 0,
+                    files_total: 0,
+                    message: msg.clone(),
+                },
+            );
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn retry_queue_file_path(app: AppHandle) -> Result<String, String> {
+    Ok(retry_queue_path(&app)?.to_string_lossy().into_owned())
 }

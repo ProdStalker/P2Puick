@@ -11,7 +11,7 @@
   --panel: rgba(18, 48, 56, 0.72);
   --line: rgba(126, 196, 210, 0.22);
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
-  font-family: "DM Sans", sans-serif;
+  font-family: "DM Sans", "Segoe UI", system-ui, sans-serif;
   color: var(--text);
   background: var(--bg0);
 }

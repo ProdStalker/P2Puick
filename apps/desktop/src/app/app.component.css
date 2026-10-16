@@ -29,7 +29,7 @@
 }
 
 .brand h1 {
-  font-family: "Syne", sans-serif;
+  font-family: "Syne", "Segoe UI", system-ui, sans-serif;
   font-size: 2rem;
   line-height: 1;
   margin: 0;
@@ -65,7 +65,7 @@
 
 .hero h2,
 .panel h2 {
-  font-family: "Syne", sans-serif;
+  font-family: "Syne", "Segoe UI", system-ui, sans-serif;
   font-size: 1.7rem;
   margin: 0 0 10px;
   letter-spacing: -0.02em;
@@ -121,7 +121,7 @@ button:disabled {
 }
 
 .code-block {
-  font-family: "Syne", sans-serif;
+  font-family: "Syne", "Segoe UI", system-ui, sans-serif;
   font-size: 3rem;
   letter-spacing: 0.28em;
   text-align: center;
@@ -197,14 +197,14 @@ button:disabled {
 }
 
 .net-info .mono {
-  font-family: "Syne", ui-monospace, monospace;
+  font-family: "Syne", "Segoe UI", ui-monospace, monospace;
   letter-spacing: 0.04em;
   color: var(--accent-2);
 }
 
 .net-info .muted {
   color: var(--muted);
-  font-family: "DM Sans", sans-serif;
+  font-family: "DM Sans", "Segoe UI", system-ui, sans-serif;
   font-size: 0.9rem;
 }
 
@@ -215,7 +215,7 @@ button:disabled {
 }
 
 .retry-box h3 {
-  font-family: "Syne", sans-serif;
+  font-family: "Syne", "Segoe UI", system-ui, sans-serif;
   font-size: 1.15rem;
   margin: 0 0 6px;
 }
@@ -241,7 +241,7 @@ button:disabled {
 
 .retry-meta .muted {
   color: var(--muted);
-  font-family: "DM Sans", sans-serif;
+  font-family: "DM Sans", "Segoe UI", system-ui, sans-serif;
   font-size: 0.78rem;
   word-break: break-word;
 }

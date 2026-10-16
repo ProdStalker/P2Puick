@@ -9,11 +9,11 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:try": "tauri build --bundles app --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'",
+    "tauri:try": "node ./scripts/tauri-try.mjs",
     "test:rust": "cargo test --manifest-path ../../Cargo.toml -p p2puick-core -p p2puick-discovery",
-    "update": "./scripts/release-update.sh",
-    "publish:update": "./scripts/publish-update.sh",
-    "publish:github": "./scripts/upload-github-release.sh"
+    "update": "node ./scripts/release-update.mjs",
+    "publish:update": "node ./scripts/publish-update.mjs",
+    "publish:github": "node ./scripts/upload-github-release.mjs"
   },
   "private": true,
   "dependencies": {

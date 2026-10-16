@@ -1,6 +1,6 @@
 {
   "name": "p2puick",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "scripts": {
     "ng": "ng",
     "start": "ng serve",

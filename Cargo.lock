@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "p2puick"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "p2puick-core",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "p2puick-core"
-version = "0.1.0"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2611,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "p2puick-discovery"
-version = "0.1.0"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "if-addrs",

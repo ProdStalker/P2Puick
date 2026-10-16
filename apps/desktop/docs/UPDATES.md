@@ -5,7 +5,7 @@ The app uses the official **Tauri Updater** plugin. Installed copies check an HT
 ## Flow
 
 1. Install a build of P2Puick.
-2. Publish a new version (`P2Puick.app.tar.gz` + `latest.json` + `changelog.json`) on GitHub Releases (`ProdStalker/p2puick-updates`).
+2. Publish a new version (platform archive + `latest.json` + `changelog.json`) on GitHub Releases (`ProdStalker/p2puick-updates`).
 3. On launch (or via **Mises à jour**), the app offers to install the new version.
 
 ## One-time setup
@@ -33,7 +33,13 @@ npx tauri signer generate -w src-tauri/updater.key -f --ci
 
 ## Publish an update
 
-macOS releases are built as a **universal2** binary (`arm64` + `x86_64`) so Apple Silicon and Intel Macs share the same `P2Puick.app.tar.gz`.
+Scripts are **Node.js** (`.mjs`) and run on Windows, macOS, and Linux:
+
+| Host OS | Bundle | `latest.json` platforms |
+|---------|--------|-------------------------|
+| macOS | universal `P2Puick.app.tar.gz` | `darwin-aarch64`, `darwin-x86_64` |
+| Windows | `P2Puick-setup.nsis.zip` | `windows-x86_64` |
+| Linux | `P2Puick.AppImage.tar.gz` | `linux-x86_64` |
 
 ```bash
 cd apps/desktop
@@ -48,7 +54,7 @@ npm run update -- --version 0.2.0 --notes "Fixes."
 npm run update -- --no-upload --notes "WIP"
 ```
 
-`latest.json` lists both `darwin-aarch64` and `darwin-x86_64` pointing at the same universal archive.
+Each run merges into local `updates/latest.json` (existing platform entries are kept). Publish from each OS (or CI) so all platforms appear in the same release.
 
 ## In the app
 
@@ -64,3 +70,4 @@ npm run update -- --no-upload --notes "WIP"
 | Check failed | Wrong URL, no HTTPS, or missing `latest.json` |
 | Update rejected | Wrong private key when building |
 | No prompt | Version in `latest.json` ≤ installed version |
+| `tauri:try` / `update` fails on Windows with `.sh` | Use the npm scripts (`node ./scripts/*.mjs`) — do not call the `.sh` wrappers on cmd.exe |

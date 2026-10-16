@@ -34,10 +34,10 @@ npm run tauri:dev
 | Script | Description |
 |--------|-------------|
 | `npm run tauri:dev` | Dev hot-reload (Angular + Rust) |
-| `npm run tauri:try` | Build release local **sans** artefacts updater (pas besoin de clé de signature) |
+| `npm run tauri:try` | Build release local **sans** artefacts updater (bundle natif : `.app` / NSIS / deb) |
 | `npm run tauri:build` | Build complet (updater inclus, clé privée requise si `createUpdaterArtifacts`) |
 | `npm run test:rust` | Tests Rust (`p2puick-core`, `p2puick-discovery`) |
-| `npm run update -- "notes"` | Bump + build **universal** macOS (Intel + Apple Silicon) signé + publish |
+| `npm run update -- "notes"` | Bump + build updater **pour l’OS courant** (signé) + publish GitHub |
 
 ### Essayer en release (local)
 
@@ -47,15 +47,27 @@ Build optimisé **sans** signature updater (arch native). Le workspace Cargo pla
 cd apps/desktop
 npm install
 npm run tauri:try
-# macOS (depuis apps/desktop) :
-open ../../target/release/bundle/macos/P2Puick.app
-# ou depuis la racine du repo :
-# open target/release/bundle/macos/P2Puick.app
 ```
 
-Les releases publiées (`npm run update`) sont **universal** (Intel + Apple Silicon) sous `target/universal-apple-darwin/release/bundle/macos/`.
+Lancer l’appli après le build (artefacts dans le `target/` **à la racine du monorepo**) :
 
-Si tu as déjà build et que seule la signature a échoué, le `.app` est quand même là — `open` suffit.
+```bash
+# macOS
+open ../../target/release/bundle/macos/P2Puick.app
+
+# Windows (installateur NSIS, ou binaire direct)
+start ../../target/release/bundle/nsis/P2Puick_*_x64-setup.exe
+# ou sans installateur :
+# ..\..\target\release\P2Puick.exe
+
+# Linux
+../../target/release/bundle/deb/p2puick_*.deb   # puis dpkg -i …
+# ou : ../../target/release/p2puick
+```
+
+`npm run update` publie les artefacts updater de **la machine courante** (macOS universal, Windows NSIS, ou Linux AppImage). Pour couvrir plusieurs OS, lancer le script sur chaque plateforme (ou CI) : `latest.json` fusionne les `platforms`.
+
+Si tu as déjà build et que seule la signature a échoué, le binaire / bundle est quand même là.
 
 Build complet (artefacts updater, clé privée requise) :
 

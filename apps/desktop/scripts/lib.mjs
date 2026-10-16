@@ -128,6 +128,13 @@ export function findFirstFile(dirs, predicate) {
 
 export function listBundleRoots(targetTriple) {
   const roots = [];
+  const cargoTarget = process.env.CARGO_TARGET_DIR;
+  if (cargoTarget) {
+    if (targetTriple) {
+      roots.push(join(cargoTarget, targetTriple, "release", "bundle"));
+    }
+    roots.push(join(cargoTarget, "release", "bundle"));
+  }
   if (targetTriple) {
     roots.push(
       join(REPO_ROOT, "target", targetTriple, "release", "bundle"),

@@ -6,7 +6,13 @@
  * Linux  → AppImage updater tarball (linux-x86_64)
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   ROOT,
@@ -27,6 +33,7 @@ let version = "";
 let notes =
   process.env.P2PUICK_UPDATE_NOTES || "Nouvelle version de P2Puick.";
 let macTarget = "universal-apple-darwin";
+let skipBuild = false;
 
 function usage() {
   console.log(`Usage: npm run publish:update -- --url URL --version X.Y.Z [options]
@@ -34,6 +41,7 @@ function usage() {
   --url URL
   --version X.Y.Z
   --notes TEXT
+  --skip-build
   --arm | --intel | --universal   (macOS only)
 `);
 }
@@ -48,6 +56,9 @@ parseArgs(process.argv.slice(2), {
   },
   "--notes": (v) => {
     notes = v;
+  },
+  "--skip-build": () => {
+    skipBuild = true;
   },
   "--arm": () => {
     macTarget = "aarch64-apple-darwin";
@@ -81,20 +92,26 @@ if (platform === "darwin") {
   archiveName = "P2Puick.app.tar.gz";
   platformKeys = ["darwin-aarch64", "darwin-x86_64"];
   targetTriple = macTarget;
-  if (macTarget === "universal-apple-darwin") {
-    run("rustup", ["target", "add", "aarch64-apple-darwin", "x86_64-apple-darwin"]);
-  } else {
-    run("rustup", ["target", "add", macTarget]);
+  if (!skipBuild) {
+    if (macTarget === "universal-apple-darwin") {
+      run("rustup", ["target", "add", "aarch64-apple-darwin", "x86_64-apple-darwin"]);
+    } else {
+      run("rustup", ["target", "add", macTarget]);
+    }
+    run("npx", ["tauri", "build", "--target", macTarget, "--bundles", "app"]);
   }
-  run("npx", ["tauri", "build", "--target", macTarget, "--bundles", "app"]);
 } else if (platform === "win32") {
   archiveName = "P2Puick-setup.nsis.zip";
   platformKeys = ["windows-x86_64"];
-  run("npx", ["tauri", "build", "--bundles", "nsis"]);
+  if (!skipBuild) {
+    run("npx", ["tauri", "build", "--bundles", "nsis"]);
+  }
 } else {
   archiveName = "P2Puick.AppImage.tar.gz";
   platformKeys = ["linux-x86_64"];
-  run("npx", ["tauri", "build", "--bundles", "appimage"]);
+  if (!skipBuild) {
+    run("npx", ["tauri", "build", "--bundles", "appimage"]);
+  }
 }
 
 const bundleRoots = listBundleRoots(targetTriple);
@@ -116,14 +133,85 @@ if (platform === "darwin") {
   }
 } else if (platform === "win32") {
   for (const root of bundleRoots) {
-    const found = findFirstFile(
-      [join(root, "nsis")],
-      (name) => name.endsWith(".nsis.zip") || name.endsWith("-setup.zip"),
+    const nsisDir = join(root, "nsis");
+    if (!existsSync(nsisDir)) continue;
+
+    const versionZip = findFirstFile(
+      [nsisDir],
+      (name) =>
+        name.includes(version) &&
+        (name.endsWith(".nsis.zip") || name.endsWith("-setup.zip")),
     );
-    if (found) {
-      archiveSrc = found;
+    if (versionZip && fileExists(`${versionZip}.sig`)) {
+      archiveSrc = versionZip;
       break;
     }
+
+    // Prefer the setup exe for this version; zip + sign for the updater.
+    const setupExe =
+      findFirstFile(
+        [nsisDir],
+        (name) =>
+          name.includes(version) &&
+          name.endsWith("-setup.exe") &&
+          !name.endsWith(".sig"),
+      ) ||
+      findFirstFile(
+        [nsisDir],
+        (name) => name.endsWith("-setup.exe") && !name.endsWith(".sig"),
+      );
+    if (!setupExe) continue;
+
+    const zipPath = setupExe.replace(/\.exe$/i, ".nsis.zip");
+    if (fileExists(zipPath)) {
+      try {
+        unlinkSync(zipPath);
+      } catch {
+        // ignore
+      }
+    }
+    if (fileExists(`${zipPath}.sig`)) {
+      try {
+        unlinkSync(`${zipPath}.sig`);
+      } catch {
+        // ignore
+      }
+    }
+    const staged = join(nsisDir, "P2Puick-setup.exe");
+    copyFileSync(setupExe, staged);
+    const zip = spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        `Compress-Archive -Path '${staged.replace(/'/g, "''")}' -DestinationPath '${zipPath.replace(/'/g, "''")}' -Force`,
+      ],
+      { encoding: "utf8" },
+    );
+    try {
+      unlinkSync(staged);
+    } catch {
+      // ignore
+    }
+    if (zip.status !== 0) {
+      console.error(zip.stderr || zip.stdout || "Compress-Archive failed");
+      process.exit(1);
+    }
+    run("npx", [
+      "tauri",
+      "signer",
+      "sign",
+      zipPath,
+      "--app-version",
+      version,
+    ]);
+    if (!fileExists(zipPath) || !fileExists(`${zipPath}.sig`)) {
+      console.error(`Failed to produce signed updater zip at ${zipPath}`);
+      process.exit(1);
+    }
+    console.log(`Prepared updater zip from ${setupExe}`);
+    archiveSrc = zipPath;
+    break;
   }
 } else {
   for (const root of bundleRoots) {
